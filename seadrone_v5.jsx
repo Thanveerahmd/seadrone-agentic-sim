@@ -2,194 +2,334 @@ import { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
 const TOTAL = 960;
-const PHASES = [
-  { id: "DEPLOY", label: "Deploy", c: "#0a8a5a", dur: 20 },
-  { id: "SEARCH", label: "Search", c: "#1a80c0", dur: 100 },
-  { id: "DETECT", label: "Detect", c: "#c89020", dur: 140 },
-  { id: "RELAY", label: "Relay", c: "#c06020", dur: 180 },
-  { id: "TRIANG", label: "Triangulate", c: "#c03030", dur: 60 },
-  { id: "TRACK", label: "Track", c: "#0a8a5a", dur: 460 },
-];
-const PE = PHASES.reduce((a, p, i) => { a.push((a[i - 1] || 0) + p.dur); return a; }, []);
 const OR = 22;
-
-function gp(tk) {
-  let a = 0;
-  for (let i = 0; i < PHASES.length; i++) {
-    if (tk < a + PHASES[i].dur) return { i, t: (tk - a) / PHASES[i].dur };
-    a += PHASES[i].dur;
-  }
-  return { i: 5, t: 1 };
-}
+const SENSE_R = 35; // FOV range (distance)
+const FOV_ANGLE = Math.PI / 3; // 60° total cone (30° each side)
+const FOV_HALF = FOV_ANGLE / 2;
 
 function lr(a, b, t) { return a + (b - a) * Math.max(0, Math.min(1, t)); }
 function eIO(t) { return t < .5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2; }
 function d3(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2); }
 
-// Search paths: drones start at bottom, A sweeps LEFT+UP, B sweeps RIGHT+UP
-// A's path curves into the upper-left where the target will be
-function gSA(sx, sz, n) {
-  var p = [];
-  for (var i = 0; i <= n; i++) {
-    var t = i / n;
-    p.push({
-      x: sx - t * 40 + Math.sin(t * Math.PI * 2.4) * 5,
-      z: sz + t * 52 + Math.sin(t * Math.PI * 1.6) * 4
-    });
-  }
-  return p;
-}
-// B's path goes far right, well away from the target zone
-// Extended path — B keeps searching during detect phase before receiving A's signal
-function gSB(sx, sz, n) {
-  var p = [];
-  for (var i = 0; i <= n; i++) {
-    var t = i / n;
-    p.push({
-      x: sx + t * 55 + Math.sin(t * Math.PI * 2.4) * 5,
-      z: sz + t * 42 + Math.sin(t * Math.PI * 1.6) * 4
-    });
-  }
-  // Extended search segment: B continues searching further right+up during detect phase
-  var last = p[p.length - 1];
-  var extLen = 60; // extra waypoints for continued search
-  for (var j = 1; j <= extLen; j++) {
-    var et = j / extLen;
-    p.push({
-      x: last.x + et * 15 + Math.sin(et * Math.PI * 3) * 6,
-      z: last.z + et * 18 - Math.cos(et * Math.PI * 2) * 5
-    });
-  }
-  return p;
+// Check if target is inside a drone's V-shaped FOV cone
+// dronePos: {x,z}, droneHeading: angle in radians, targetPos: {x,z}
+function inFOV(dronePos, droneHeading, targetPos) {
+  var dx = targetPos.x - dronePos.x;
+  var dz = targetPos.z - dronePos.z;
+  var dist = Math.sqrt(dx * dx + dz * dz);
+  if (dist > SENSE_R || dist < 0.5) return false;
+  var angleToTarget = Math.atan2(dz, dx);
+  var diff = angleToTarget - droneHeading;
+  // Normalize to [-PI, PI]
+  diff = ((diff + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  return Math.abs(diff) <= FOV_HALF;
 }
 
-var SA = gSA(-3, -26, 90);  // A: bottom → upper-left  (ends ~(-43, 26))
-var SB = gSB(3, -26, 90);   // B: bottom → far upper-right (ends ~(58, 16))
+// Get drone heading from position and target/direction
+function droneHeading(dronePos, lookAt) {
+  return Math.atan2(lookAt.z - dronePos.z, lookAt.x - dronePos.x);
+}
 
-// Target starts in A's search zone (upper-left), cruises left
-var DETECT_START = 20 + 100; // tick when detect phase begins (DEPLOY + SEARCH)
-function tAt(tk) {
-  var stop = PE[4];
-  if (tk >= stop) return tAt(stop - 1);
-  var t = tk / stop;
-
-  if (tk < DETECT_START) {
-    // Pre-detection: target cruises in the upper-left zone, drifting toward A
-    return {
-      x: -18 - t * 55 + Math.sin(t * Math.PI * 2) * 5,
-      z: 28 - t * 20 + Math.cos(t * Math.PI * 1.5) * 4
-    };
-  }
-  // Post-detection: target spots A and tries to flee — runs RIGHT (away from A)
-  var dt = (tk - DETECT_START) / (stop - DETECT_START);
-  var t0 = DETECT_START / stop;
-  var baseX = -18 - t0 * 55 + Math.sin(t0 * Math.PI * 2) * 5;
-  var baseZ = 28 - t0 * 20 + Math.cos(t0 * Math.PI * 1.5) * 4;
-  // Evasion: flee right and down (away from A which is on the left)
-  var flee = Math.min(dt * 1.5, 1);
-  var evadeX = flee * 40 + Math.sin(dt * Math.PI * 5) * 10 * flee;
-  var evadeZ = -flee * 20 + Math.cos(dt * Math.PI * 4.5) * 8 * flee;
-  var decay = 1 - dt * dt * 0.4;
+// Get the 3 points of the FOV triangle (for 2D rendering)
+function fovTriangle(pos, heading, range) {
+  var lAng = heading - FOV_HALF;
+  var rAng = heading + FOV_HALF;
   return {
-    x: baseX + evadeX * decay,
-    z: baseZ + evadeZ * decay
+    tip: pos,
+    left: { x: pos.x + range * Math.cos(lAng), z: pos.z + range * Math.sin(lAng) },
+    right: { x: pos.x + range * Math.cos(rAng), z: pos.z + range * Math.sin(rAng) }
   };
 }
 
-function posAt(tk) {
-  var r = gp(tk);
-  var pi = r.i, lt = r.t;
-  var tg = tAt(tk);
-  var sbE = SB[SB.length - 1];
-  var aP = SA[0], bP = SB[0], aD = false, bD = false, cm = false;
+// ════════════════════════════════════════════════════
+// SCENARIO DEFINITIONS
+// ════════════════════════════════════════════════════
 
-  var commAB = false; // A-to-B communication active
-
-  // B's primary search ends at index 90, extended search continues after
-  var bSearchEnd = 90; // index where original search pattern ends
-  var bTotalPts = SB.length - 1; // total extended path points
-
-  if (pi === 0) {
-    // Deploy from bottom center
-    aP = { x: lr(-3, SA[0].x, lt), z: lr(-30, SA[0].z, lt) };
-    bP = { x: lr(3, SB[0].x, lt), z: lr(-30, SB[0].z, lt) };
-  } else if (pi === 1) {
-    // Search: A goes upper-left, B goes upper-right
-    var ia = Math.min(Math.floor(lt * SA.length), SA.length - 1);
-    var ib = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
-    aP = SA[ia]; bP = SB[ib];
-    if (lt > .92) { aD = true; cm = true; }
-  } else if (pi === 2) {
-    // Detect: A locks on and chases the fleeing target
-    aD = true; cm = true;
-    var tgPrev = tAt(Math.max(0, tk - 4));
-    var fleeAng = Math.atan2(tg.z - tgPrev.z, tg.x - tgPrev.x);
-    var chaseAng = fleeAng + Math.PI + lt * 0.6 - 0.3;
-    var chaseDist = OR - lt * 6;
-    aP = { x: tg.x + chaseDist * Math.cos(chaseAng), z: tg.z + chaseDist * Math.sin(chaseAng) };
-
-    // B keeps searching independently — doesn't know about target yet
-    // First 70%: B continues its extended search pattern
-    // At 70%: A's signal reaches B → commAB activates, B starts to react
-    if (lt < 0.7) {
-      // B continues searching further along its extended path
-      var bExtIdx = bSearchEnd + Math.min(Math.floor(lt / 0.7 * (bTotalPts - bSearchEnd)), bTotalPts - bSearchEnd);
-      bP = SB[bExtIdx];
-    } else {
-      // Signal received! B stops searching, begins to turn toward target
-      commAB = true;
-      var bSignalPos = SB[bTotalPts]; // B's position when signal arrives
-      // B starts a slow turn — easing into heading change (first reaction)
-      var reactT = (lt - 0.7) / 0.3;
-      var reactEase = reactT * reactT; // gentle start
-      bP = {
-        x: lr(bSignalPos.x, bSignalPos.x + (tg.x - bSignalPos.x) * 0.05, reactEase),
-        z: lr(bSignalPos.z, bSignalPos.z + (tg.z - bSignalPos.z) * 0.05, reactEase)
-      };
-    }
-  } else if (pi === 3) {
-    // Relay: A keeps pursuing, B accelerates toward the target
-    aD = true; cm = true; commAB = true;
-    var tgPrev2 = tAt(Math.max(0, tk - 4));
-    var fleeAng2 = Math.atan2(tg.z - tgPrev2.z, tg.x - tgPrev2.x);
-    var chaseAng2 = fleeAng2 + Math.PI + lt * 1.0;
-    var chaseDist2 = (OR - 6) - lt * 2;
-    aP = { x: tg.x + chaseDist2 * Math.cos(chaseAng2), z: tg.z + chaseDist2 * Math.sin(chaseAng2) };
-    // B's starting position = where it was at end of detect phase (signal received)
-    var bStart = SB[bTotalPts];
-    // B: first 10% — final heading adjustment, engine throttle-up
-    // Then cubic ease-in acceleration toward target orbit position
-    var rawT = Math.max(0, (lt - 0.1) / 0.9);
-    var bEase = rawT < 0.5
-      ? rawT * rawT * rawT / (0.5 * 0.5 * 0.5) * 0.35
-      : 0.35 + 0.65 * eIO((rawT - 0.5) / 0.5);
-    // B approaches from opposite side of A for triangulation geometry
-    var bGoalAng = chaseAng2 + Math.PI;
-    var bGoal = { x: tg.x + OR * Math.cos(bGoalAng), z: tg.z + OR * Math.sin(bGoalAng) };
-    var bMid = { x: (bStart.x + bGoal.x) / 2, z: (bStart.z + bGoal.z) / 2 + 10 };
-    var m = 1 - bEase;
-    bP = { x: m * m * bStart.x + 2 * m * bEase * bMid.x + bEase * bEase * bGoal.x, z: m * m * bStart.z + 2 * m * bEase * bMid.z + bEase * bEase * bGoal.z };
-    if (lt > .65) bD = true;
-  } else {
-    // Track + Triangulate: both drones lock the (tiring) target
-    // Strict 180° opposition — A and B always on opposite sides, never collide
-    aD = true; bD = true; cm = true;
-    var dur = PHASES[4].dur + PHASES[5].dur;
-    var pt = Math.min(Math.max((tk - PE[3]) / dur, 0), 1);
-    // Base angle rotates steadily; both drones stay exactly PI apart
-    var baseAng = Math.PI * 0.4 + pt * Math.PI * 3.2;
-    // Small radial wobble for realism, but mirrored so they never close in on each other
-    var wobble = 1.5 * Math.sin(pt * Math.PI * 6);
-    aP = { x: tg.x + (OR + wobble) * Math.cos(baseAng), z: tg.z + (OR + wobble) * Math.sin(baseAng) };
-    bP = { x: tg.x + (OR - wobble) * Math.cos(baseAng + Math.PI), z: tg.z + (OR - wobble) * Math.sin(baseAng + Math.PI) };
+var SCENARIOS = {
+  s1: {
+    id: "s1",
+    name: "Scenario 1: Detect & Triangulate",
+    desc: "A detects target, relays to B, both triangulate",
+    phases: [
+      { id: "DEPLOY", label: "Deploy",     c: "#0a8a5a", dur: 20 },
+      { id: "SEARCH", label: "Search",     c: "#1a80c0", dur: 100 },
+      { id: "DETECT", label: "Detect",     c: "#c89020", dur: 140 },
+      { id: "RELAY",  label: "Relay",      c: "#c06020", dur: 180 },
+      { id: "TRIANG", label: "Triangulate",c: "#c03030", dur: 60 },
+      { id: "TRACK",  label: "Track",      c: "#0a8a5a", dur: 460 },
+    ],
+  },
+  s2: {
+    id: "s2",
+    name: "Scenario 2: Lose & Re-acquire",
+    desc: "A locks target, loses it, B re-acquires and relays back",
+    phases: [
+      { id: "DEPLOY",  label: "Deploy",     c: "#0a8a5a", dur: 20 },
+      { id: "SEARCH",  label: "Search",     c: "#1a80c0", dur: 100 },
+      { id: "A_LOCK",  label: "A Lock",     c: "#c89020", dur: 130 },
+      { id: "A_LOST",  label: "A Lost",     c: "#c03030", dur: 150 },
+      { id: "B_LOCK",  label: "B Lock",     c: "#4838d0", dur: 110 },
+      { id: "TRIANG",  label: "Triangulate",c: "#c06020", dur: 60 },
+      { id: "TRACK",   label: "Track",      c: "#0a8a5a", dur: 390 },
+    ],
   }
-  return { aP: aP, bP: bP, aD: aD, bD: bD, cm: cm, commAB: commAB, tg: tg, pi: pi, lt: lt };
+};
+
+// ── Build scenario runtime data ──
+function buildScenario(scen) {
+  var PHASES = scen.phases;
+  var PE = PHASES.reduce(function(a, p, i) { a.push((a[i - 1] || 0) + p.dur); return a; }, []);
+  var trackPhaseIdx = PHASES.length - 1;
+  var triangPhaseIdx = PHASES.length - 2;
+
+  function gp(tk) {
+    var a = 0;
+    for (var i = 0; i < PHASES.length; i++) {
+      if (tk < a + PHASES[i].dur) return { i: i, t: (tk - a) / PHASES[i].dur };
+      a += PHASES[i].dur;
+    }
+    return { i: PHASES.length - 1, t: 1 };
+  }
+
+  // Search paths (shared by both scenarios)
+  function gSA(sx, sz, n) {
+    var p = [];
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      p.push({ x: sx - t * 40 + Math.sin(t * Math.PI * 2.4) * 5, z: sz + t * 52 + Math.sin(t * Math.PI * 1.6) * 4 });
+    }
+    return p;
+  }
+  function gSB(sx, sz, n) {
+    var p = [];
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      p.push({ x: sx + t * 55 + Math.sin(t * Math.PI * 2.4) * 5, z: sz + t * 42 + Math.sin(t * Math.PI * 1.6) * 4 });
+    }
+    var last = p[p.length - 1];
+    for (var j = 1; j <= 80; j++) {
+      var et = j / 80;
+      p.push({ x: last.x + et * 12 + Math.sin(et * Math.PI * 3) * 7, z: last.z + et * 20 - Math.cos(et * Math.PI * 2) * 6 });
+    }
+    return p;
+  }
+  var SA = gSA(-3, -26, 90);
+  var SB = gSB(3, -26, 90);
+  var bSearchEnd = 90;
+  var bTotalPts = SB.length - 1;
+
+  // ── Scenario 1 ──
+  if (scen.id === "s1") {
+    var DETECT_START = PE[1];
+    var tAt = function(tk) {
+      var stop = PE[triangPhaseIdx];
+      if (tk >= stop) return tAt(stop - 1);
+      var t = tk / stop;
+      if (tk < DETECT_START) {
+        return { x: -22 - t * 50 + Math.sin(t * Math.PI * 2) * 5, z: 28 - t * 20 + Math.cos(t * Math.PI * 1.5) * 4 };
+      }
+      var dt = (tk - DETECT_START) / (stop - DETECT_START);
+      var t0 = DETECT_START / stop;
+      var bx = -22 - t0 * 50 + Math.sin(t0 * Math.PI * 2) * 5;
+      var bz = 28 - t0 * 20 + Math.cos(t0 * Math.PI * 1.5) * 4;
+      var fl = Math.min(dt * 1.5, 1);
+      var decay = 1 - dt * dt * 0.4;
+      return { x: bx + fl * 40 * decay + Math.sin(dt * Math.PI * 5) * 10 * fl * decay, z: bz - fl * 20 * decay + Math.cos(dt * Math.PI * 4.5) * 8 * fl * decay };
+    };
+    var posAt = function(tk) {
+      var r = gp(tk), pi = r.i, lt = r.t;
+      var tg = tAt(tk);
+      var aP = SA[0], bP = SB[0], aD = false, bD = false, cm = false, commAB = false, commBA = false;
+      if (pi === 0) {
+        aP = { x: lr(-3, SA[0].x, lt), z: lr(-30, SA[0].z, lt) };
+        bP = { x: lr(3, SB[0].x, lt), z: lr(-30, SB[0].z, lt) };
+      } else if (pi === 1) {
+        var ia = Math.min(Math.floor(lt * SA.length), SA.length - 1);
+        var ib = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
+        aP = SA[ia]; bP = SB[ib];
+      } else if (pi === 2) {
+        aD = true; cm = true;
+        var tgP = tAt(Math.max(0, tk - 4));
+        var fa = Math.atan2(tg.z - tgP.z, tg.x - tgP.x);
+        var ca = fa + Math.PI + lt * 0.6 - 0.3, cd = SENSE_R * 0.7 - lt * 4;
+        aP = { x: tg.x + cd * Math.cos(ca), z: tg.z + cd * Math.sin(ca) };
+        if (lt < 0.5) {
+          var bi = bSearchEnd + Math.min(Math.floor(lt / 0.5 * (bTotalPts - bSearchEnd)), bTotalPts - bSearchEnd);
+          bP = SB[bi];
+        } else {
+          commAB = true;
+          var bs = SB[bTotalPts], rt = (lt - 0.5) / 0.5, re = rt * rt * rt;
+          bP = { x: lr(bs.x, bs.x + (tg.x - bs.x) * 0.15, re), z: lr(bs.z, bs.z + (tg.z - bs.z) * 0.15, re) };
+        }
+      } else if (pi === 3) {
+        aD = true; cm = true; commAB = true;
+        var tgP2 = tAt(Math.max(0, tk - 4));
+        var fa2 = Math.atan2(tg.z - tgP2.z, tg.x - tgP2.x);
+        var ca2 = fa2 + Math.PI + lt * 1.0, cd2 = (SENSE_R * 0.7 - 4) - lt * 2;
+        aP = { x: tg.x + cd2 * Math.cos(ca2), z: tg.z + cd2 * Math.sin(ca2) };
+        var bSt = SB[bTotalPts];
+        var rawT = Math.max(0, (lt - 0.1) / 0.9);
+        var bE = rawT < 0.5 ? rawT * rawT * rawT / (0.5 * 0.5 * 0.5) * 0.35 : 0.35 + 0.65 * eIO((rawT - 0.5) / 0.5);
+        var bGA = ca2 + Math.PI;
+        var bG = { x: tg.x + OR * Math.cos(bGA), z: tg.z + OR * Math.sin(bGA) };
+        var bM = { x: (bSt.x + bG.x) / 2, z: (bSt.z + bG.z) / 2 + 10 };
+        var m = 1 - bE;
+        bP = { x: m * m * bSt.x + 2 * m * bE * bM.x + bE * bE * bG.x, z: m * m * bSt.z + 2 * m * bE * bM.z + bE * bE * bG.z };
+        if (lt > .65) bD = true;
+      } else {
+        aD = true; bD = true; cm = true;
+        var dur = PHASES[triangPhaseIdx].dur + PHASES[trackPhaseIdx].dur;
+        var pt = Math.min(Math.max((tk - PE[triangPhaseIdx - 1]) / dur, 0), 1);
+        var ba = Math.PI * 0.4 + pt * Math.PI * 3.2, w = 1.5 * Math.sin(pt * Math.PI * 6);
+        aP = { x: tg.x + (OR + w) * Math.cos(ba), z: tg.z + (OR + w) * Math.sin(ba) };
+        bP = { x: tg.x + (OR - w) * Math.cos(ba + Math.PI), z: tg.z + (OR - w) * Math.sin(ba + Math.PI) };
+      }
+      // Compute headings: face target when tracking, else face forward along path
+      var aH = droneHeading(aP, tg);
+      var bH = droneHeading(bP, tg);
+      if (pi === 1) { // during search, face along path direction
+        var iaH = Math.min(Math.floor(lt * SA.length), SA.length - 1);
+        var ibH = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
+        if (iaH > 0) aH = droneHeading(SA[iaH - 1], SA[iaH]);
+        if (ibH > 0) bH = droneHeading(SB[ibH - 1], SB[ibH]);
+      }
+      return { aP: aP, bP: bP, aD: aD, bD: bD, cm: cm, commAB: commAB, commBA: commBA, aInRange: inFOV(aP, aH, tg), bInRange: inFOV(bP, bH, tg), aHeading: aH, bHeading: bH, tg: tg, pi: pi, lt: lt };
+    };
+    var statusText = function(st, phase, ts) {
+      if (ts) return { text: "CONTAINED", color: "#0a8a5a", icon: "●" };
+      if (st.aD && st.bD && !st.commAB) return { text: "TRIANGULATING", color: "#c06020", icon: "◉" };
+      if (st.commAB && st.bD) return { text: "B CLOSING IN", color: "#c06020", icon: "◉" };
+      if (st.commAB && !st.bD) return { text: "A LOCKED · RELAY→B", color: "#20d090", icon: "◈" };
+      if (st.aD && !st.commAB) return { text: "A CHASING · B SEARCHING", color: "#c89020", icon: "◐" };
+      if (phase.i >= 1) return { text: "SEARCHING", color: "#1a80c0", icon: "○" };
+      return null;
+    };
+    return { PHASES: PHASES, PE: PE, SA: SA, SB: SB, tAt: tAt, posAt: posAt, gp: gp, statusText: statusText, triangPhaseIdx: triangPhaseIdx };
+  }
+
+  // ── Scenario 2 ──
+  var P1_END = PE[1], P2_END = PE[2], P3_END = PE[3];
+  function aSearchLost(startPos, n) {
+    var p = [];
+    for (var i = 0; i <= n; i++) {
+      var t = i / n;
+      // A searches BACKWARD first (left/down), then sweeps right — looking in wrong places
+      // This ensures FOV cone points away from target (which fled right)
+      p.push({
+        x: startPos.x - 15 * (1 - t) + t * t * 25 + Math.sin(t * Math.PI * 3) * 10,
+        z: startPos.z - 10 * (1 - t) + t * 15 + Math.cos(t * Math.PI * 2.5) * 12
+      });
+    }
+    return p;
+  }
+  var tAt2 = function(tk) {
+    var stop = PE[triangPhaseIdx];
+    if (tk >= stop) return tAt2(stop - 1);
+    if (tk < P1_END) { var t = tk / P1_END; return { x: -22 - t * 20 + Math.sin(t * Math.PI * 1.8) * 4, z: 26 + t * 4 + Math.cos(t * Math.PI) * 3 }; }
+    var lockX = -22 - 20 + Math.sin(Math.PI * 1.8) * 4, lockZ = 26 + 4 + Math.cos(Math.PI) * 3;
+    if (tk < P2_END) { var dt = (tk - P1_END) / (P2_END - P1_END); var ac = dt * dt; return { x: lockX + ac * 65 + Math.sin(dt * Math.PI * 3) * 8 * dt, z: lockZ - ac * 15 + Math.cos(dt * Math.PI * 2.5) * 6 * dt }; }
+    var lX = lockX + 65 + Math.sin(Math.PI * 3) * 8, lZ = lockZ - 15 + Math.cos(Math.PI * 2.5) * 6;
+    if (tk < P3_END) { var dt2 = (tk - P2_END) / (P3_END - P2_END); var sd = 1 - dt2 * 0.6; return { x: lX + dt2 * 25 * sd + Math.sin(dt2 * Math.PI * 4) * 10, z: lZ + dt2 * 12 * sd + Math.cos(dt2 * Math.PI * 3) * 8 }; }
+    var sf = 0.4, bDX = lX + 25 * sf + Math.sin(Math.PI * 4) * 10, bDZ = lZ + 12 * sf + Math.cos(Math.PI * 3) * 8;
+    var dt3 = (tk - P3_END) / (stop - P3_END); var tired = 1 - dt3 * dt3 * 0.7;
+    return { x: bDX + dt3 * 15 * tired + Math.sin(dt3 * Math.PI * 3) * 6 * tired, z: bDZ - dt3 * 10 * tired + Math.cos(dt3 * Math.PI * 2) * 5 * tired };
+  };
+  var posAt2 = function(tk) {
+    var r = gp(tk), pi = r.i, lt = r.t;
+    var tg = tAt2(tk);
+    var aP = SA[0], bP = SB[0], aD = false, bD = false, cm = false, commAB = false, commBA = false;
+    if (pi === 0) {
+      aP = { x: lr(-3, SA[0].x, lt), z: lr(-30, SA[0].z, lt) };
+      bP = { x: lr(3, SB[0].x, lt), z: lr(-30, SB[0].z, lt) };
+    } else if (pi === 1) {
+      var ia = Math.min(Math.floor(lt * SA.length), SA.length - 1);
+      var ib = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
+      aP = SA[ia]; bP = SB[ib];
+    } else if (pi === 2) {
+      aD = true; cm = true;
+      var tgP = tAt2(Math.max(0, tk - 4));
+      var fa = Math.atan2(tg.z - tgP.z, tg.x - tgP.x);
+      var ca = fa + Math.PI + lt * 0.5 - 0.2, cd = SENSE_R * 0.7 - lt * 4;
+      aP = { x: tg.x + cd * Math.cos(ca), z: tg.z + cd * Math.sin(ca) };
+      if (lt < 0.5) { var bi = bSearchEnd + Math.min(Math.floor(lt / 0.5 * (bTotalPts - bSearchEnd)), bTotalPts - bSearchEnd); bP = SB[bi]; }
+      else { commAB = true; var bs = SB[bTotalPts], rt = (lt - 0.5) / 0.5, re = rt * rt * rt; bP = { x: lr(bs.x, bs.x + (tg.x - bs.x) * 0.15, re), z: lr(bs.z, bs.z + (tg.z - bs.z) * 0.15, re) }; }
+    } else if (pi === 3) {
+      var aLS = tAt2(P2_END - 1); var aCE = { x: aLS.x + 5, z: aLS.z };
+      var aSP = aSearchLost(aCE, 60); var asi = Math.min(Math.floor(lt * aSP.length), aSP.length - 1);
+      aP = aSP[asi];
+      var bSP = SB[bTotalPts]; var bGA = tAt2(P2_END);
+      var bE = lt < 0.4 ? lt * lt * lt / (0.4 * 0.4 * 0.4) * 0.3 : 0.3 + 0.7 * eIO((lt - 0.4) / 0.6);
+      bP = { x: lr(bSP.x, bGA.x + 15 + Math.sin(lt * Math.PI * 2) * 10, bE), z: lr(bSP.z, bGA.z + 5 + Math.cos(lt * Math.PI * 1.5) * 8, bE) };
+      cm = true;
+    } else if (pi === 4) {
+      bD = true; cm = true; commBA = true;
+      var tgP3 = tAt2(Math.max(0, tk - 4));
+      var fa3 = Math.atan2(tg.z - tgP3.z, tg.x - tgP3.x);
+      var ca3 = fa3 + Math.PI - lt * 0.5 + 0.2, cd3 = SENSE_R * 0.65 - lt * 3;
+      bP = { x: tg.x + cd3 * Math.cos(ca3), z: tg.z + cd3 * Math.sin(ca3) };
+      var aLE = tAt2(P2_END - 1); var aFP = { x: aLE.x + 35, z: aLE.z + 10 };
+      var rT = Math.max(0, (lt - 0.15) / 0.85);
+      var aE = rT < 0.5 ? rT * rT * rT / (0.5 * 0.5 * 0.5) * 0.35 : 0.35 + 0.65 * eIO((rT - 0.5) / 0.5);
+      var aGA = ca3 + Math.PI;
+      var aG = { x: tg.x + OR * Math.cos(aGA), z: tg.z + OR * Math.sin(aGA) };
+      aP = { x: lr(aFP.x, aG.x, aE), z: lr(aFP.z, aG.z, aE) };
+      if (lt > 0.6) aD = true;
+    } else {
+      aD = true; bD = true; cm = true;
+      var dur = PHASES[triangPhaseIdx].dur + PHASES[trackPhaseIdx].dur;
+      var pt = Math.min(Math.max((tk - PE[triangPhaseIdx - 1]) / dur, 0), 1);
+      var ba = Math.PI * 0.4 + pt * Math.PI * 3.2, w = 1.5 * Math.sin(pt * Math.PI * 6);
+      aP = { x: tg.x + (OR + w) * Math.cos(ba), z: tg.z + (OR + w) * Math.sin(ba) };
+      bP = { x: tg.x + (OR - w) * Math.cos(ba + Math.PI), z: tg.z + (OR - w) * Math.sin(ba + Math.PI) };
+    }
+    var aH = droneHeading(aP, tg);
+    var bH = droneHeading(bP, tg);
+    if (pi === 1) {
+      // Search: face along path direction
+      var iaH2 = Math.min(Math.floor(lt * SA.length), SA.length - 1);
+      var ibH2 = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
+      if (iaH2 > 0) aH = droneHeading(SA[iaH2 - 1], SA[iaH2]);
+      if (ibH2 > 0) bH = droneHeading(SB[ibH2 - 1], SB[ibH2]);
+    } else if (pi === 3) {
+      // A_LOST: A searches in wrong directions (doesn't know where target is)
+      // A faces along its search path, sweeping away from target
+      var aSPH = aSearchLost({ x: tAt2(P2_END - 1).x + 5, z: tAt2(P2_END - 1).z }, 60);
+      var asiH = Math.min(Math.floor(lt * aSPH.length), aSPH.length - 1);
+      if (asiH > 0) aH = droneHeading(aSPH[asiH - 1], aSPH[asiH]);
+      // B faces along its approach direction toward last known area
+      var bSPH = SB[bTotalPts];
+      var bGoalH = tAt2(P2_END);
+      bH = droneHeading(bP, { x: bGoalH.x + 15, z: bGoalH.z + 5 });
+    } else if (pi === 4 && lt < 0.6) {
+      // B_LOCK early: A is still navigating, faces toward B's position (relay direction)
+      aH = droneHeading(aP, bP);
+    }
+    return { aP: aP, bP: bP, aD: aD, bD: bD, cm: cm, commAB: commAB, commBA: commBA, aInRange: inFOV(aP, aH, tg), bInRange: inFOV(bP, bH, tg), aHeading: aH, bHeading: bH, tg: tg, pi: pi, lt: lt };
+  };
+  var statusText2 = function(st, phase, ts) {
+    if (ts) return { text: "CONTAINED", color: "#0a8a5a", icon: "●" };
+    if (st.pi >= triangPhaseIdx) return { text: "TRIANGULATING", color: "#c06020", icon: "◉" };
+    if (st.commBA) return { text: "B LOCKED · RELAY→A", color: "#6050e0", icon: "◈" };
+    if (st.pi === 3) return { text: "A LOST TARGET · SEARCHING", color: "#c03030", icon: "✕" };
+    if (st.commAB && !st.bD) return { text: "A LOCKED · RELAY→B", color: "#20d090", icon: "◈" };
+    if (st.aD && !st.commAB) return { text: "A CHASING · B SEARCHING", color: "#c89020", icon: "◐" };
+    if (phase.i >= 1) return { text: "SEARCHING", color: "#1a80c0", icon: "○" };
+    return null;
+  };
+  return { PHASES: PHASES, PE: PE, SA: SA, SB: SB, tAt: tAt2, posAt: posAt2, gp: gp, statusText: statusText2, triangPhaseIdx: triangPhaseIdx };
+}
+
+// Pre-build scenarios
+var scenarioCache = {};
+function getScenario(id) {
+  if (!scenarioCache[id]) scenarioCache[id] = buildScenario(SCENARIOS[id]);
+  return scenarioCache[id];
 }
 
 // 2D Map - pure SVG, no state, just reads tick
-function Map2D({ tick }) {
-  var s = posAt(tick);
-  var ts = tick >= PE[4];
+function Map2D({ tick, scenario }) {
+  var s = scenario.posAt(tick);
+  var ts = tick >= scenario.PE[scenario.triangPhaseIdx];
   var SC = 4.5;
   var W = 600, H = 600;
   var cx = function(x) { return W / 2 + x * SC; };
@@ -198,7 +338,7 @@ function Map2D({ tick }) {
   // Build trails directly - sample every 12 ticks for performance
   var aTrail = [], bTrail = [], tTrail = [];
   for (var t = 0; t <= tick; t += 12) {
-    var st = posAt(t);
+    var st = scenario.posAt(t);
     aTrail.push(st.aP);
     bTrail.push(st.bP);
     if (st.pi >= 2) tTrail.push(st.tg);
@@ -221,43 +361,106 @@ function Map2D({ tick }) {
       {bTrail.length > 1 && <path d={pD(bTrail)} fill="none" stroke="#4838d0" strokeWidth="2" opacity=".25" />}
       {tTrail.length > 1 && <path d={pD(tTrail)} fill="none" stroke="#c03030" strokeWidth="1.5" opacity=".2" strokeDasharray="4 5" />}
 
+      {/* ── FOV Vision Cones (V-shaped) ── */}
+      {(function() {
+        var fovA = s.aHeading != null ? fovTriangle(s.aP, s.aHeading, SENSE_R) : null;
+        var fovB = s.bHeading != null ? fovTriangle(s.bP, s.bHeading, SENSE_R) : null;
+        var aCol = s.aInRange ? "#0a8a5a" : "#90a8b8";
+        var bCol = s.bInRange ? "#4838d0" : "#90a8b8";
+        // Build arc path for rounded FOV cone
+        function fovPath(fov, heading) {
+          var r = SENSE_R * SC;
+          // SVG arc: from left edge, arc to right edge, line back to tip
+          var lx = cx(fov.left.x), ly = cy(fov.left.z);
+          var rx = cx(fov.right.x), ry = cy(fov.right.z);
+          var tx = cx(fov.tip.x), ty = cy(fov.tip.z);
+          return "M" + tx.toFixed(1) + "," + ty.toFixed(1) +
+                 " L" + lx.toFixed(1) + "," + ly.toFixed(1) +
+                 " A" + r.toFixed(1) + "," + r.toFixed(1) + " 0 0,1 " + rx.toFixed(1) + "," + ry.toFixed(1) +
+                 " Z";
+        }
+        return <g>
+          {/* A FOV cone */}
+          {fovA && <path d={fovPath(fovA, s.aHeading)} fill={aCol} fillOpacity={s.aInRange ? 0.12 : 0.04} stroke={aCol} strokeWidth={s.aInRange ? "1.5" : "0.8"} opacity={s.aInRange ? ".5" : ".25"} strokeDasharray={s.aInRange ? "none" : "5 3"} />}
+          {/* B FOV cone */}
+          {fovB && <path d={fovPath(fovB, s.bHeading)} fill={bCol} fillOpacity={s.bInRange ? 0.12 : 0.04} stroke={bCol} strokeWidth={s.bInRange ? "1.5" : "0.8"} opacity={s.bInRange ? ".5" : ".25"} strokeDasharray={s.bInRange ? "none" : "5 3"} />}
+
+          {/* A lock-on crosshair */}
+          {s.aInRange && <g>
+            <line x1={cx(s.tg.x) - 12} y1={cy(s.tg.z)} x2={cx(s.tg.x) - 5} y2={cy(s.tg.z)} stroke="#0a8a5a" strokeWidth="1.5" opacity=".6" />
+            <line x1={cx(s.tg.x) + 5} y1={cy(s.tg.z)} x2={cx(s.tg.x) + 12} y2={cy(s.tg.z)} stroke="#0a8a5a" strokeWidth="1.5" opacity=".6" />
+            <line x1={cx(s.tg.x)} y1={cy(s.tg.z) - 12} x2={cx(s.tg.x)} y2={cy(s.tg.z) - 5} stroke="#0a8a5a" strokeWidth="1.5" opacity=".6" />
+            <line x1={cx(s.tg.x)} y1={cy(s.tg.z) + 5} x2={cx(s.tg.x)} y2={cy(s.tg.z) + 12} stroke="#0a8a5a" strokeWidth="1.5" opacity=".6" />
+            <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="14" fill="none" stroke="#0a8a5a" strokeWidth="1" opacity=".35" strokeDasharray="3 3">
+              <animateTransform attributeName="transform" type="rotate" from={"0 " + cx(s.tg.x) + " " + cy(s.tg.z)} to={"360 " + cx(s.tg.x) + " " + cy(s.tg.z)} dur="4s" repeatCount="indefinite" />
+            </circle>
+            <text x={cx(s.aP.x)} y={cy(s.aP.z) + 18} textAnchor="middle" style={{ fontSize: "10px", fill: "#0a8a5a", fontFamily: "monospace", fontWeight: 700 }}>A LOCKED</text>
+          </g>}
+          {/* B lock-on crosshair */}
+          {s.bInRange && <g>
+            <line x1={cx(s.tg.x) - 12} y1={cy(s.tg.z)} x2={cx(s.tg.x) - 5} y2={cy(s.tg.z)} stroke="#4838d0" strokeWidth="1.5" opacity=".6" />
+            <line x1={cx(s.tg.x) + 5} y1={cy(s.tg.z)} x2={cx(s.tg.x) + 12} y2={cy(s.tg.z)} stroke="#4838d0" strokeWidth="1.5" opacity=".6" />
+            <line x1={cx(s.tg.x)} y1={cy(s.tg.z) - 12} x2={cx(s.tg.x)} y2={cy(s.tg.z) - 5} stroke="#4838d0" strokeWidth="1.5" opacity=".6" />
+            <line x1={cx(s.tg.x)} y1={cy(s.tg.z) + 5} x2={cx(s.tg.x)} y2={cy(s.tg.z) + 12} stroke="#4838d0" strokeWidth="1.5" opacity=".6" />
+            <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="14" fill="none" stroke="#4838d0" strokeWidth="1" opacity=".35" strokeDasharray="3 3">
+              <animateTransform attributeName="transform" type="rotate" from={"0 " + cx(s.tg.x) + " " + cy(s.tg.z)} to={"-360 " + cx(s.tg.x) + " " + cy(s.tg.z)} dur="4s" repeatCount="indefinite" />
+            </circle>
+            <text x={cx(s.bP.x)} y={cy(s.bP.z) + 18} textAnchor="middle" style={{ fontSize: "10px", fill: "#4838d0", fontFamily: "monospace", fontWeight: 700 }}>B LOCKED</text>
+          </g>}
+          {/* Dual lock */}
+          {s.aInRange && s.bInRange && <g>
+            <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="20" fill="none" stroke="#c06020" strokeWidth="1.5" opacity=".4" strokeDasharray="4 2">
+              <animateTransform attributeName="transform" type="rotate" from={"0 " + cx(s.tg.x) + " " + cy(s.tg.z)} to={"360 " + cx(s.tg.x) + " " + cy(s.tg.z)} dur="3s" repeatCount="indefinite" />
+            </circle>
+            <text x={cx(s.tg.x)} y={cy(s.tg.z) - 26} textAnchor="middle" style={{ fontSize: "10px", fill: "#c06020", fontFamily: "monospace", fontWeight: 700 }}>DUAL LOCK</text>
+          </g>}
+        </g>;
+      })()}
+
       {/* Comm link A→B */}
       {s.commAB && <line x1={cx(s.aP.x)} y1={cy(s.aP.z)} x2={cx(s.bP.x)} y2={cy(s.bP.z)} stroke="#20d090" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />}
       {s.commAB && [0, .25, .5, .75].map(function(off, ci) {
         var ct = ((tick * .008 + off) % 1);
         return <circle key={"cp" + ci} cx={lr(cx(s.aP.x), cx(s.bP.x), ct)} cy={lr(cy(s.aP.z), cy(s.bP.z), ct)} r={3 + 2 * Math.sin(ct * Math.PI)} fill="#20d090" opacity={.7 * Math.sin(ct * Math.PI)} />;
       })}
-      {s.commAB && <g>
-        <circle cx={cx(s.aP.x)} cy={cy(s.aP.z)} r="14" fill="none" stroke="#20d090" strokeWidth=".8" opacity=".2" />
-        <circle cx={cx(s.aP.x)} cy={cy(s.aP.z)} r="22" fill="none" stroke="#20d090" strokeWidth=".5" opacity=".1" />
-        <text x={(cx(s.aP.x) + cx(s.bP.x)) / 2} y={(cy(s.aP.z) + cy(s.bP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "10px", fill: "#20d090", fontFamily: "monospace", fontWeight: 700 }}>COMM</text>
-      </g>}
+      {s.commAB && <text x={(cx(s.aP.x) + cx(s.bP.x)) / 2} y={(cy(s.aP.z) + cy(s.bP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "10px", fill: "#20d090", fontFamily: "monospace", fontWeight: 700 }}>A→B</text>}
 
-      {s.pi >= 4 && <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r={OR * SC} fill="none" stroke="#0a8a5a" strokeWidth="1" opacity=".15" strokeDasharray="6 6" />}
-      {s.pi >= 4 && <line x1={cx(s.aP.x)} y1={cy(s.aP.z)} x2={cx(s.bP.x)} y2={cy(s.bP.z)} stroke="#0a8a5a" strokeWidth=".5" opacity=".12" strokeDasharray="5 7" />}
+      {/* Comm link B→A */}
+      {s.commBA && <line x1={cx(s.bP.x)} y1={cy(s.bP.z)} x2={cx(s.aP.x)} y2={cy(s.aP.z)} stroke="#6050e0" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />}
+      {s.commBA && [0, .25, .5, .75].map(function(off, ci) {
+        var ct = ((tick * .008 + off) % 1);
+        return <circle key={"cpb" + ci} cx={lr(cx(s.bP.x), cx(s.aP.x), ct)} cy={lr(cy(s.bP.z), cy(s.aP.z), ct)} r={3 + 2 * Math.sin(ct * Math.PI)} fill="#6050e0" opacity={.7 * Math.sin(ct * Math.PI)} />;
+      })}
+      {s.commBA && <text x={(cx(s.aP.x) + cx(s.bP.x)) / 2} y={(cy(s.aP.z) + cy(s.bP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "10px", fill: "#6050e0", fontFamily: "monospace", fontWeight: 700 }}>B→A</text>}
 
+      {/* Triangulation orbit + link */}
+      {s.pi >= 5 && <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r={OR * SC} fill="none" stroke="#0a8a5a" strokeWidth="1" opacity=".15" strokeDasharray="6 6" />}
+      {s.pi >= 5 && <line x1={cx(s.aP.x)} y1={cy(s.aP.z)} x2={cx(s.bP.x)} y2={cy(s.bP.z)} stroke="#0a8a5a" strokeWidth=".5" opacity=".12" strokeDasharray="5 7" />}
+
+      {/* Bearing lines */}
       {s.aD && <line x1={cx(s.aP.x)} y1={cy(s.aP.z)} x2={cx(s.tg.x)} y2={cy(s.tg.z)} stroke="#c89020" strokeWidth="1.4" opacity=".4" strokeDasharray="6 5" />}
       {s.bD && <line x1={cx(s.bP.x)} y1={cy(s.bP.z)} x2={cx(s.tg.x)} y2={cy(s.tg.z)} stroke="#c06020" strokeWidth="1.4" opacity=".4" strokeDasharray="6 5" />}
 
+      {/* Target */}
       <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="9" fill="#d03030" stroke="#fff" strokeWidth="2" />
       <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="3.5" fill="#f8a0a0" />
-      <text x={cx(s.tg.x) + 14} y={cy(s.tg.z) + 5} style={{ fontSize: "13px", fill: ts ? "#0a8a5a" : "#b02020", fontFamily: "monospace", fontWeight: 700 }}>
-        {ts ? "IDLE" : s.pi >= 2 ? "EVADING" : ""}
+      <text x={cx(s.tg.x) + 14} y={cy(s.tg.z) + 5} style={{ fontSize: "13px", fill: ts ? "#0a8a5a" : s.pi === 3 ? "#c03030" : "#b02020", fontFamily: "monospace", fontWeight: 700 }}>
+        {ts ? "IDLE" : s.pi === 3 ? "ESCAPED" : s.pi >= 2 ? "EVADING" : ""}
       </text>
 
-      {s.aD && <circle cx={cx(s.aP.x)} cy={cy(s.aP.z)} r="18" fill="none" stroke="#0a8a5a" strokeWidth="1" opacity=".25" />}
+      {/* Drone A */}
       <polygon points={cx(s.aP.x) + "," + (cy(s.aP.z) - 9) + " " + (cx(s.aP.x) - 8) + "," + (cy(s.aP.z) + 7) + " " + (cx(s.aP.x) + 8) + "," + (cy(s.aP.z) + 7)} fill="#0a8a5a" stroke="#fff" strokeWidth="1.2" />
       <text x={cx(s.aP.x)} y={cy(s.aP.z) - 16} textAnchor="middle" style={{ fontSize: "13px", fill: "#0a8a5a", fontFamily: "monospace", fontWeight: 700 }}>
-        {"A" + (dA ? " " + dA + "m" : "")}
+        {"A" + (dA ? " " + dA + "m" : "") + (s.pi === 3 && !s.aD ? " LOST" : "")}
       </text>
 
-      {s.bD && <circle cx={cx(s.bP.x)} cy={cy(s.bP.z)} r="18" fill="none" stroke="#4838d0" strokeWidth="1" opacity=".25" />}
+      {/* Drone B */}
       <polygon points={cx(s.bP.x) + "," + (cy(s.bP.z) - 9) + " " + (cx(s.bP.x) - 8) + "," + (cy(s.bP.z) + 7) + " " + (cx(s.bP.x) + 8) + "," + (cy(s.bP.z) + 7)} fill="#4838d0" stroke="#fff" strokeWidth="1.2" />
       <text x={cx(s.bP.x)} y={cy(s.bP.z) - 16} textAnchor="middle" style={{ fontSize: "13px", fill: "#4838d0", fontFamily: "monospace", fontWeight: 700 }}>
         {"B" + (dB ? " " + dB + "m" : "")}
       </text>
 
-      {s.pi >= 4 && <g>
+      {s.pi >= 5 && <g>
         <rect x={W - 130} y="10" width="118" height="28" rx="5" fill="#eaf6f0" stroke="#0a8a5a30" strokeWidth=".6" />
         <text x={W - 71} y="29" textAnchor="middle" style={{ fontSize: "13px", fill: "#0a8a5a", fontFamily: "monospace", fontWeight: 700 }}>180° OPT</text>
       </g>}
@@ -272,6 +475,7 @@ function Map2D({ tick }) {
 export default function App() {
   var mountRef = useRef(null);
   var initDone = useRef(false);
+  var [scenarioId, setScenarioId] = useState("s1");
   var [tick, setTick] = useState(0);
   var [playing, setPlaying] = useState(false);
   var [speed, setSpeed] = useState(1);
@@ -279,10 +483,12 @@ export default function App() {
   var draggingDivider = useRef(false);
   var containerRef = useRef(null);
   var tickRef = useRef(0);
+  var scenarioRef = useRef(scenarioId);
   var raf = useRef(null);
   var lastTime = useRef(null);
 
   tickRef.current = tick;
+  scenarioRef.current = scenarioId;
 
   // 3D Scene - one-time init
   useEffect(function() {
@@ -488,6 +694,63 @@ export default function App() {
     );
     recvRing.rotation.x = -Math.PI / 2; recvRing.visible = false; scene.add(recvRing);
 
+    // 3D FOV cone meshes (V-shaped vision)
+    function mkFovCone(color) {
+      var segments = 24;
+      var verts = [0, 0.1, 0]; // tip at origin
+      var indices = [];
+      for (var fi = 0; fi <= segments; fi++) {
+        var a = -FOV_HALF + (fi / segments) * FOV_ANGLE;
+        verts.push(SENSE_R * Math.cos(a), 0.1, SENSE_R * Math.sin(a));
+        if (fi > 0) indices.push(0, fi, fi + 1);
+      }
+      var geo = new THREE.BufferGeometry();
+      geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
+      geo.setIndex(indices);
+      geo.computeVertexNormals();
+      var mat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: .1, side: THREE.DoubleSide });
+      var mesh = new THREE.Mesh(geo, mat);
+      // wireframe edge
+      var edgeVerts = [0, 0.12, 0];
+      for (var ei = 0; ei <= segments; ei++) {
+        var ea = -FOV_HALF + (ei / segments) * FOV_ANGLE;
+        edgeVerts.push(SENSE_R * Math.cos(ea), 0.12, SENSE_R * Math.sin(ea));
+      }
+      var edgeGeo = new THREE.BufferGeometry();
+      edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(edgeVerts, 3));
+      var edgeLine = new THREE.LineLoop(edgeGeo, new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: .25 }));
+      var group = new THREE.Group();
+      group.add(mesh); group.add(edgeLine);
+      group.userData.mat = mat;
+      group.userData.edgeMat = edgeLine.material;
+      scene.add(group);
+      return group;
+    }
+    var senseRingA = mkFovCone(0x0a8a5a);
+    var senseRingB = mkFovCone(0x4838d0);
+
+    // 3D lock-on indicators around target
+    var lockRingA = new THREE.Mesh(
+      new THREE.RingGeometry(3.5, 4.0, 32),
+      new THREE.MeshBasicMaterial({ color: 0x0a8a5a, transparent: true, opacity: .4, side: THREE.DoubleSide })
+    );
+    lockRingA.rotation.x = -Math.PI / 2; lockRingA.visible = false; scene.add(lockRingA);
+    var lockRingB = new THREE.Mesh(
+      new THREE.RingGeometry(4.5, 5.0, 32),
+      new THREE.MeshBasicMaterial({ color: 0x4838d0, transparent: true, opacity: .4, side: THREE.DoubleSide })
+    );
+    lockRingB.rotation.x = -Math.PI / 2; lockRingB.visible = false; scene.add(lockRingB);
+    var lockBeamA = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+      new THREE.LineBasicMaterial({ color: 0x0a8a5a, transparent: true, opacity: .6 })
+    );
+    lockBeamA.visible = false; scene.add(lockBeamA);
+    var lockBeamB = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]),
+      new THREE.LineBasicMaterial({ color: 0x4838d0, transparent: true, opacity: .6 })
+    );
+    lockBeamB.visible = false; scene.add(lockBeamB);
+
     // Resize handler
     function onResize() {
       var rw = el.clientWidth, rh = el.clientHeight;
@@ -525,8 +788,9 @@ export default function App() {
     function animate() {
       requestAnimationFrame(animate);
       var tk = tickRef.current;
-      var st = posAt(tk);
-      var stopped = tk >= PE[4];
+      var curSc = getScenario(scenarioRef.current);
+      var st = curSc.posAt(tk);
+      var stopped = tk >= curSc.PE[curSc.triangPhaseIdx];
       var time = Date.now() * .001;
 
       // Realistic ocean waves — multiple overlapping sine waves
@@ -563,7 +827,54 @@ export default function App() {
       var fleeing = st.pi >= 2 && !stopped;
       tgt.rotation.z = fleeing ? Math.sin(time * 3.5 + 3) * .1 : rock(3);
       tgt.rotation.x = fleeing ? Math.sin(time * 2.8) * .06 : pitch(3);
-      if (!stopped) { var tp = tAt(Math.max(0, tk - 3)); tgt.rotation.y = Math.atan2(st.tg.x - tp.x, st.tg.z - tp.z); }
+      if (!stopped) { var tp = curSc.tAt(Math.max(0, tk - 3)); tgt.rotation.y = Math.atan2(st.tg.x - tp.x, st.tg.z - tp.z); }
+
+      // 3D FOV cones — position, rotate to heading, color by detection
+      senseRingA.position.set(st.aP.x, 0, st.aP.z);
+      senseRingA.rotation.y = st.aHeading != null ? -st.aHeading + Math.PI / 2 : 0;
+      senseRingA.userData.mat.opacity = st.aInRange ? .15 : .05;
+      senseRingA.userData.mat.color.setHex(st.aInRange ? 0x0a8a5a : 0x6a8a9a);
+      senseRingA.userData.edgeMat.opacity = st.aInRange ? .4 : .12;
+      senseRingA.userData.edgeMat.color.setHex(st.aInRange ? 0x0a8a5a : 0x6a8a9a);
+
+      senseRingB.position.set(st.bP.x, 0, st.bP.z);
+      senseRingB.rotation.y = st.bHeading != null ? -st.bHeading + Math.PI / 2 : 0;
+      senseRingB.userData.mat.opacity = st.bInRange ? .15 : .05;
+      senseRingB.userData.mat.color.setHex(st.bInRange ? 0x4838d0 : 0x6a8a9a);
+      senseRingB.userData.edgeMat.opacity = st.bInRange ? .4 : .12;
+      senseRingB.userData.edgeMat.color.setHex(st.bInRange ? 0x4838d0 : 0x6a8a9a);
+
+      // Lock-on rings around target — spinning, pulsing when in range
+      lockRingA.visible = st.aInRange;
+      if (st.aInRange) {
+        lockRingA.position.set(st.tg.x, 1.2, st.tg.z);
+        lockRingA.rotation.z = time * 1.5;
+        lockRingA.material.opacity = .3 + .15 * Math.sin(time * 3);
+        var lsa = 1 + .15 * Math.sin(time * 2);
+        lockRingA.scale.set(lsa, lsa, lsa);
+      }
+      lockRingB.visible = st.bInRange;
+      if (st.bInRange) {
+        lockRingB.position.set(st.tg.x, 1.0, st.tg.z);
+        lockRingB.rotation.z = -time * 1.2;
+        lockRingB.material.opacity = .3 + .15 * Math.sin(time * 3 + 1);
+        var lsb = 1 + .15 * Math.sin(time * 2 + 1);
+        lockRingB.scale.set(lsb, lsb, lsb);
+      }
+
+      // Lock-on beam lines (drone → target) when in sensing range
+      function uLockBeam(beam, from, to, show) {
+        beam.visible = show;
+        if (show) {
+          var lp = beam.geometry.attributes.position;
+          lp.setXYZ(0, from.x, 2.8, from.z);
+          lp.setXYZ(1, to.x, 1.5, to.z);
+          lp.needsUpdate = true;
+          beam.material.opacity = .4 + .2 * Math.sin(time * 4);
+        }
+      }
+      uLockBeam(lockBeamA, st.aP, st.tg, st.aInRange && !st.aD);
+      uLockBeam(lockBeamB, st.bP, st.tg, st.bInRange && !st.bD);
 
       // Blinking antenna lights
       var blink = Math.sin(time * 4) > 0.3 ? 1 : 0.15;
@@ -603,10 +914,10 @@ export default function App() {
       uLine(bearA, st.aP, st.tg, st.aD);
       uLine(bearB, st.bP, st.tg, st.bD);
 
-      orbRing.visible = st.pi >= 4;
-      if (st.pi >= 4) orbRing.position.set(st.tg.x, .2, st.tg.z);
-      diaLine.visible = st.pi >= 4;
-      if (st.pi >= 4) { var dp = diaLine.geometry.attributes.position; dp.setXYZ(0, st.aP.x, .5, st.aP.z); dp.setXYZ(1, st.bP.x, .5, st.bP.z); dp.needsUpdate = true; }
+      orbRing.visible = st.pi >= 5;
+      if (st.pi >= 5) orbRing.position.set(st.tg.x, .2, st.tg.z);
+      diaLine.visible = st.pi >= 5;
+      if (st.pi >= 5) { var dp = diaLine.geometry.attributes.position; dp.setXYZ(0, st.aP.x, .5, st.aP.z); dp.setXYZ(1, st.bP.x, .5, st.bP.z); dp.needsUpdate = true; }
       idleRing.visible = stopped;
       if (stopped) { idleRing.position.set(st.tg.x, .1, st.tg.z); idleRing.material.opacity = .15 + .08 * Math.sin(time * 1.5); }
 
@@ -622,44 +933,45 @@ export default function App() {
         pkt2.position.set(lr(st.bP.x, st.aP.x, (pp + .5) % 1), 2.2, lr(st.bP.z, st.aP.z, (pp + .5) % 1));
       } else { pkt2.visible = false; }
 
-      // Comm signals A→B (detect + relay phases)
-      if (st.commAB) {
-        // Comm beam line
+      // Comm signals — A→B or B→A
+      var hasComm = st.commAB || st.commBA;
+      if (hasComm) {
+        var txPos = st.commAB ? st.aP : st.bP; // transmitter
+        var rxPos = st.commAB ? st.bP : st.aP; // receiver
+        var commColor = st.commAB ? 0x20d090 : 0x6050e0;
+
         commBeam.visible = true;
+        commBeam.material.color.setHex(commColor);
         var cbp = commBeam.geometry.attributes.position;
-        cbp.setXYZ(0, st.aP.x, 2.5, st.aP.z);
-        cbp.setXYZ(1, st.bP.x, 2.5, st.bP.z);
+        cbp.setXYZ(0, txPos.x, 2.5, txPos.z);
+        cbp.setXYZ(1, rxPos.x, 2.5, rxPos.z);
         cbp.needsUpdate = true;
         commBeam.computeLineDistances();
         commBeam.material.opacity = .2 + .15 * Math.sin(time * 3);
 
-        // Staggered packets traveling A→B
         for (var ci = 0; ci < commPkts.length; ci++) {
           var ct = ((time * .8 + ci * .25) % 1);
           commPkts[ci].visible = true;
-          commPkts[ci].position.set(
-            lr(st.aP.x, st.bP.x, ct),
-            2.5 + Math.sin(ct * Math.PI) * 1.2,
-            lr(st.aP.z, st.bP.z, ct)
-          );
+          commPkts[ci].material.color.setHex(commColor);
+          commPkts[ci].position.set(lr(txPos.x, rxPos.x, ct), 2.5 + Math.sin(ct * Math.PI) * 1.2, lr(txPos.z, rxPos.z, ct));
           commPkts[ci].material.opacity = .9 * Math.sin(ct * Math.PI);
           var cs = .25 + .2 * Math.sin(ct * Math.PI);
           commPkts[ci].scale.set(cs * 3, cs * 3, cs * 3);
         }
 
-        // Signal pulse rings at A (transmitting)
         for (var si = 0; si < sigRings.length; si++) {
           sigRings[si].visible = true;
-          sigRings[si].position.set(st.aP.x, 2.6, st.aP.z);
+          sigRings[si].material.color.setHex(commColor);
+          sigRings[si].position.set(txPos.x, 2.6, txPos.z);
           var sp = ((time * 1.2 + si * .33) % 1);
           var sr2 = 1 + sp * 5;
           sigRings[si].scale.set(sr2, sr2, sr2);
           sigRings[si].material.opacity = .35 * (1 - sp);
         }
 
-        // Receive pulse at B
         recvRing.visible = true;
-        recvRing.position.set(st.bP.x, 2.0, st.bP.z);
+        recvRing.material.color.setHex(commColor);
+        recvRing.position.set(rxPos.x, 2.0, rxPos.z);
         var rp = ((time * 1.5) % 1);
         var rr = 1 + rp * 3;
         recvRing.scale.set(rr, rr, rr);
@@ -751,10 +1063,11 @@ export default function App() {
     };
   }, []);
 
-  var phase = gp(tick);
-  var ph = PHASES[phase.i];
-  var ts = tick >= PE[4];
-  var st = posAt(tick);
+  var sc = getScenario(scenarioId);
+  var phase = sc.gp(tick);
+  var ph = sc.PHASES[phase.i];
+  var ts = tick >= sc.PE[sc.triangPhaseIdx];
+  var st = sc.posAt(tick);
   var btn = { border: "none", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 11, borderRadius: 6, padding: "7px 18px" };
 
   return (
@@ -765,14 +1078,12 @@ export default function App() {
           <span style={{ fontSize: 14, fontWeight: 800, color: "#0a8a5a", letterSpacing: 1.5 }}>SEADRONE</span>
           <span style={{ fontSize: 14, fontWeight: 300, color: "#8a9aaa" }}>MULTI-AGENT</span>
         </div>
-        <div style={{ fontSize: 11 }}>
-          {ts ? <span style={{ color: "#0a8a5a", fontWeight: 700 }}>● CONTAINED</span>
-            : st.aD && st.bD && !st.commAB ? <span style={{ color: "#c06020" }}>◉ TRIANGULATING</span>
-            : st.commAB && st.bD ? <span style={{ color: "#c06020" }}>◉ B CLOSING IN</span>
-            : st.commAB && !st.bD ? <span style={{ color: "#20d090" }}>◈ SIGNAL SENT · B RESPONDING</span>
-            : st.aD && !st.bD && !st.commAB ? <span style={{ color: "#c89020" }}>◐ A CHASING · B SEARCHING</span>
-            : phase.i >= 1 ? <span style={{ color: "#1a80c0" }}>○ SEARCHING</span> : null}
-          <span style={{ color: "#b0bcc8", marginLeft: 12, fontSize: 10 }}>T+{(tick / TOTAL * 65).toFixed(1)}s</span>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11 }}>
+          <select value={scenarioId} onChange={function(e) { setScenarioId(e.target.value); setPlaying(false); setTick(0); scenarioCache = {}; }} style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 600, padding: "4px 8px", borderRadius: 5, border: "1px solid #d0dae4", background: "#f2f6f9", color: "#2a3a4a", cursor: "pointer" }}>
+            {Object.values(SCENARIOS).map(function(s) { return <option key={s.id} value={s.id}>{s.name}</option>; })}
+          </select>
+          {(function() { var info = sc.statusText(st, phase, ts); return info ? <span style={{ color: info.color, fontWeight: 700 }}>{info.icon} {info.text}</span> : null; })()}
+          <span style={{ color: "#b0bcc8", fontSize: 10 }}>T+{(tick / TOTAL * 65).toFixed(1)}s</span>
         </div>
       </div>
 
@@ -803,20 +1114,21 @@ export default function App() {
           display: "flex", flexDirection: "column", gap: 6
         }}>
           <span style={{ fontSize: 10, fontWeight: 700, color: "#1a80c0", letterSpacing: .8 }}>SPATIAL MAP</span>
-          <Map2D tick={tick} />
+          <Map2D tick={tick} scenario={sc} />
           <div style={{ display: "flex", gap: 10, fontSize: 9, color: "#6a7a8a" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #0a8a5a" }} />A</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #4838d0" }} />B</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#d03030" }} />Target</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 12, borderTop: "1.5px dashed #c89020" }} />Bearing</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "6px solid transparent", borderRight: "6px solid transparent", borderBottom: "10px solid #90a8b8", opacity: .5 }} />FOV</span>
           </div>
         </div>
       </div>
 
       <div style={{ padding: "8px 14px 10px", background: "#f8fafb", borderTop: "1px solid #e8eff5" }}>
         <div style={{ display: "flex", gap: 2, marginBottom: 6 }}>
-          {PHASES.map(function(p, idx) {
-            var start = idx === 0 ? 0 : PE[idx - 1];
+          {sc.PHASES.map(function(p, idx) {
+            var start = idx === 0 ? 0 : sc.PE[idx - 1];
             var act = idx <= phase.i, cur = idx === phase.i;
             return <div key={idx} style={{ flex: p.dur, cursor: "pointer" }} onClick={function() { setPlaying(false); setTick(start); }}>
               <div style={{ height: 5, borderRadius: 3, background: act ? p.c : "#e4ecf2", opacity: cur ? 1 : act ? .45 : .25, position: "relative" }}>
