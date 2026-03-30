@@ -14,19 +14,25 @@ Based on `sea_drone_data_v1.json` — 394 frames from a real sea drone tracking 
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
+| **Compute** | NVIDIA Jetson (SeaDrone Lite, SYSID=254) | Hardware stack |
+| **Flight Controller** | Pixhawk V6X (via UART4 MAVLink) | Hardware stack |
+| **Camera** | RouteCam RTSP (192.168.1.10) | Network topology |
+| **Comms** | Radio Mesh RF Bridge (IP-based, 192.168.1.x) | Network topology |
+| **Control** | MAVLink RC_OVERRIDE (Jetson → Pixhawk) | Control authority |
 | Frame rate | ~1.3 FPS (394 frames / ~300s) | Timestamps |
-| Detection model | YOLOv8 | `processing_info.model_name` |
+| Detection model | YOLOv8-nano + SAMURAI tracker | Processing pipeline |
 | Inference time | ~118ms per frame | `processing_info.inference_time_ms` |
 | Camera resolution | 960 x 540 | `frame_resolution` |
 | Ground speed | 0.6 — 3.6 m/s | `velocity.ground_speed_mps` |
-| IMU data | Roll, Pitch, Yaw (deg) | `telemetry_info.imu` |
-| Compass heading | 0 — 360 deg | `telemetry_info.compass` |
-| GPS (drone only) | Lat/Lon, altitude, fix type, satellites | `telemetry_info.gps` |
-| Battery | 64 — 67% over 5 min session | `telemetry_info.battery` |
+| IMU data | Roll, Pitch, Yaw (deg) | Pixhawk → MAVLink ATTITUDE |
+| Compass heading | 0 — 360 deg | Pixhawk → MAVLink VFR_HUD |
+| GPS (drone only) | Lat/Lon, altitude, fix type, satellites | Pixhawk → GPS_RAW_INT |
+| Battery | 64 — 67% over 5 min session | Pixhawk → SYS_STATUS |
 | Detection confidence | 0.45 — 0.81 | `detected_object.confidence` |
 | Tracking velocity | -274 to +90 px/s (X), -44 to +61 px/s (Y) | `tracking.velocity_px_per_sec` |
 | Max track lost count | 349 frames | `tracking.lost_count` |
-| Steering | PWM 1580 (fixed — manual mode) | `servo_outputs.channels` |
+| Steering | PWM via RC_OVERRIDE ch1=steering, ch3=throttle | MAVLink control |
+| Failsafe | RC Controller 2.4GHz (FAILSAFE ONLY) | Control authority |
 
 ### 2.2 Tracking Model
 

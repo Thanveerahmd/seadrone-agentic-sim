@@ -6,7 +6,7 @@
 ## 1. Problem Statement
 
 Two autonomous sea drones must:
-1. **Find** a target vessel using onboard cameras (YOLOv8 + SAMURAI tracking)
+1. **Find** a target vessel using onboard cameras (YOLOv8-nano + SAMURAI tracking)
 2. **Triangulate** its position using bearing-only measurements from two different positions
 3. **Recover** when a drone loses visual contact — efficiently redirect the swarm
 4. **Do all of this without GPS** — using dead reckoning from a shared launch reference
@@ -17,6 +17,134 @@ Two autonomous sea drones must:
 - FOV: ~60° horizontal camera cone
 - DR drift: 3.4% over 800m (validated)
 - Comm latency: 12ms (D2D) or 45ms (D2G via ground station)
+
+---
+
+## 1.1 Real Hardware Platform
+
+### Per-Drone Hardware Stack
+
+| Component | Model | Role | IP/Interface |
+|-----------|-------|------|-------------|
+| **Compute** | NVIDIA Jetson (SeaDrone Lite) | AI inference, decision engine, MAVLink control | 192.168.1.x, SYSID=254 |
+| **Camera** | RouteCam (RTSP) | Video stream to Jetson | 192.168.1.10 |
+| **Flight Controller** | Pixhawk V6X | Autopilot, IMU, compass, GPS, motor control | 192.168.1.41, UART4 serial to Jetson |
+| **Radio** | Radio Mesh (RF Bridge) | IP bridge between drone and ground station | 192.168.1.x subnet |
+| **Network** | D-Link Switch | Onboard LAN connecting camera, Jetson, radio | 192.168.1.x |
+| **ESC + Motors** | Standard marine ESC | PWM-driven from Pixhawk | Direct wire |
+
+### Ground Station Hardware
+
+| Component | Role | IP |
+|-----------|------|-----|
+| **Mac workstation** | GS orchestrator, monitoring, operator UI | 192.168.1.160 |
+| **Mission Planner** | Telemetry monitoring (NO CONTROL authority) | SYSID=255 |
+| **Radio Mesh A** | Ground-side RF bridge | Via D-Link Switch |
+| **RC Controller** | FAILSAFE ONLY (2.4GHz RF) | Direct to Pixhawk |
+
+### Control Authority Model
+
+```
+┌────────────────────────────────────────────────────────┐
+│                 CONTROL PRIORITY                        │
+│                                                        │
+│  1. Jetson (SYSID=254) — FULL CONTROL                 │
+│     └─ UART4 Serial → Pixhawk → MAVLink RC_OVERRIDE   │
+│                                                        │
+│  2. Mission Planner (SYSID=255) — NO CONTROL           │
+│     └─ UDP via Mesh → Monitoring only                  │
+│                                                        │
+│  3. RC Controller — FAILSAFE ONLY                      │
+│     └─ 2.4GHz RF → Direct to Pixhawk                  │
+│        Only activates if Jetson link is lost            │
+└────────────────────────────────────────────────────────┘
+```
+
+**Key insight:** The Jetson has FULL autonomous control via MAVLink RC_OVERRIDE. This means the agentic decision engine runs on the Jetson and directly commands steering + throttle. No human in the loop required for normal operation.
+
+### Current Single-Drone Data Flow (Baseline)
+
+```
+RouteCam ──RTSP──→ Jetson ──UART4──→ Pixhawk ──PWM──→ Motors
+  (RTSP)         ┌─────────────────┐   (V6X)
+  Video          │ YOLOv8-nano     │
+  Frames         │    ↓            │
+                 │ Bounding Boxes  │
+                 │    ↓            │
+                 │ SAMURAI Tracker │
+                 │ (IoU Lock)      │
+                 │    ↓            │
+                 │ Target Position │
+                 │    ↓            │
+                 │ PID Controller  │
+                 │    ↓            │
+                 │ Steering/       │
+                 │ Throttle        │
+                 │    ↓            │
+                 │ MAVLink         │
+                 │ RC_OVERRIDE     │
+                 └─────────────────┘
+                        │
+          Operator ─────┘ (Click to Lock / Arm / Launch / Stop)
+```
+
+### Network Topology (Current Single-Drone)
+
+```
+GROUND (192.168.1.x)                    BOAT (192.168.1.x)
+┌─────────────────┐                     ┌──────────────────────────┐
+│                 │                     │                          │
+│  Mac            │    RF Bridge        │  RouteCam                │
+│  192.168.1.160  │                     │  192.168.1.10            │
+│       │         │                     │       │                  │
+│  D-Link Switch──┼──Radio Mesh A ═══ Radio Mesh B──D-Link Switch │
+│       │         │                     │       │                  │
+│  Mission        │                     │  Jetson ──UART4── Pixhawk│
+│  Planner        │                     │  192.168.1.x    .41     │
+│                 │                     │                          │
+└─────────────────┘                     └──────────────────────────┘
+```
+
+### Multi-Drone Network Extension (Proposed)
+
+For two-drone triangulation, extend the network:
+
+```
+GROUND STATION (192.168.1.x)
+┌──────────────────────────────────┐
+│  Mac 192.168.1.160               │
+│  ├─ GS Orchestrator Agent        │
+│  ├─ Mission Planner (monitor)    │
+│  └─ Web Dashboard (sim viewer)   │
+│       │                          │
+│  D-Link Switch                   │
+│       │                          │
+│  Radio Mesh GS                   │
+└───────┼──────────────────────────┘
+        │ RF Bridge (shared mesh network)
+    ┌───┴──────────────────┐
+    │                      │
+DRONE A (192.168.2.x)   DRONE B (192.168.3.x)
+┌──────────────────┐     ┌──────────────────┐
+│ Radio Mesh A     │     │ Radio Mesh B     │
+│      │           │     │      │           │
+│ D-Link Switch    │     │ D-Link Switch    │
+│   │        │     │     │   │        │     │
+│ RouteCam Jetson  │     │ RouteCam Jetson  │
+│  .10     .20     │     │  .10     .20     │
+│          │       │     │          │       │
+│       Pixhawk    │     │       Pixhawk    │
+│        .41       │     │        .41       │
+└──────────────────┘     └──────────────────┘
+          │                        │
+          └────── D2D Direct ──────┘
+          (Radio Mesh A ↔ Radio Mesh B
+           on shared mesh frequency)
+```
+
+**Subnet separation:** Each drone gets its own subnet (192.168.2.x / 192.168.3.x) to prevent IP conflicts. The mesh radios handle routing between subnets.
+
+**D2D capability:** The RF mesh radios can communicate directly between drones WITHOUT going through the ground station — enabling D2D protocol mode. The ground station is simply another node on the mesh.
 
 ---
 
@@ -481,46 +609,105 @@ When target is LOST in D2D mode:
 
 ## 6. Integrated System Architecture
 
-### 6.1 Onboard Processing Pipeline (Each Drone)
+### 6.1 Onboard Processing Pipeline (Each Drone — Runs on Jetson)
 
 ```
-Camera Frame (960x540, ~1.3 FPS)
+RouteCam (RTSP, 960x540, ~1.3 FPS)
        │
        ▼
-┌──────────────┐
-│   YOLOv8     │  118ms inference
-│  Detection   │  → bbox + confidence
-└──────┬───────┘
+┌──────────────────┐
+│  YOLOv8-nano     │  118ms inference on Jetson GPU
+│  Detection       │  → bbox + confidence + class label
+└──────┬───────────┘
        │ if new detection
        ▼
-┌──────────────┐
-│   SAMURAI    │  persistent tracking
-│   Tracker    │  → track_id, velocity, lost_count
-└──────┬───────┘
-       │
-       ▼
-┌──────────────┐
-│   Bearing    │  bbox centroid → camera angle → absolute bearing
-│  Estimator   │  + roll/pitch compensation from IMU
-└──────┬───────┘
-       │
-       ▼
 ┌──────────────────┐
-│  Dead Reckoning  │  compass heading + speed → (x, y) position
-│  Navigator       │  updated every sensor tick
+│  SAMURAI Tracker  │  SAM2-based persistent tracking
+│  (IoU Lock)      │  → track_id, velocity_px/s, lost_count
+│                  │  Operator can "Click to Lock" initial target
 └──────┬───────────┘
        │
        ▼
 ┌──────────────────┐
-│  Decision Engine │  What to do next?
-│  (State Machine) │  → SEARCH / TRACK / INTERCEPT / LOST_RECOVERY
+│  Bearing          │  bbox centroid → camera angle → absolute bearing
+│  Estimator       │  + roll/pitch compensation from Pixhawk IMU
+│                  │  (IMU data via MAVLink over UART4)
 └──────┬───────────┘
        │
-       ├──→ COMM TX: BEARING_REPORT / TARGET_LOST / AGENT_STATUS
+       ▼
+┌──────────────────┐
+│  Dead Reckoning  │  Pixhawk compass heading + speed → (x, y)
+│  Navigator       │  Local frame from GS launch point
+│                  │  Updated every MAVLink heartbeat (~1 Hz)
+└──────┬───────────┘
        │
-       ├──→ AUTOPILOT: heading + throttle commands
+       ▼
+┌──────────────────────────────────────────────────────┐
+│  AGENTIC DECISION ENGINE (new for multi-drone)       │
+│                                                      │
+│  Current (single-drone): PID Controller → RC_OVERRIDE│
+│                                                      │
+│  Proposed (multi-drone): State Machine that decides: │
+│    SEARCH → TRACK → INTERCEPT → LOST_RECOVERY       │
+│    Outputs:                                          │
+│      ├─→ PID targets (heading + throttle)            │
+│      ├─→ MAVLink RC_OVERRIDE → UART4 → Pixhawk      │
+│      ├─→ COMM TX via Radio Mesh (UDP packets)        │
+│      └─→ COMM RX from GS or other drone             │
+└──────────────────────────────────────────────────────┘
        │
-       └──→ COMM RX: INTERCEPT_CMD / SEARCH_ASSIGN / TRIANGULATION_FIX
+       ▼
+┌──────────────────┐
+│  MAVLink         │  Steering/Throttle PWM values
+│  RC_OVERRIDE     │  → UART4 → Pixhawk V6X → ESC → Motors
+└──────────────────┘
+```
+
+### 6.1.1 What Changes for Multi-Drone (Current → Proposed)
+
+The current single-drone system has a simple pipeline: detect → track → PID follow → RC_OVERRIDE. For multi-drone GPS-denied triangulation, the **Agentic Decision Engine** replaces the simple PID controller as the decision-maker:
+
+```
+CURRENT (Single-Drone):
+  SAMURAI Target Position → PID Controller → Steering/Throttle → RC_OVERRIDE
+
+PROPOSED (Multi-Drone Agent):
+  SAMURAI Target Position ─┐
+  Bearing Estimate ────────┤
+  DR Position ─────────────┼──→ DECISION ENGINE ──→ PID Targets ──→ RC_OVERRIDE
+  COMM RX (from GS/B) ────┤      │
+  Battery/Sensor State ────┘      │
+                                  ├──→ COMM TX (BEARING_REPORT, TARGET_LOST, etc.)
+                                  └──→ State transitions (SEARCH↔TRACK↔INTERCEPT)
+```
+
+**The PID controller is preserved** — it still converts a target heading + speed into steering/throttle PWM. But instead of always pointing at the visual target, the Decision Engine can command the PID to:
+- Follow a search pattern (no target in FOV)
+- Navigate to an intercept waypoint (target reported by other drone)
+- Execute a pincer search (target lost, coordinated recovery)
+- Orbit at standoff distance (triangulation maintenance)
+
+### 6.1.2 MAVLink Integration
+
+The Jetson communicates with Pixhawk via MAVLink over UART4:
+
+```
+JETSON → PIXHAWK (control):
+  MAV_CMD: RC_OVERRIDE (ch1=steering, ch3=throttle)
+  Rate: 10-20 Hz (PID output rate)
+
+PIXHAWK → JETSON (telemetry):
+  ATTITUDE: roll, pitch, yaw (IMU data for bearing correction)
+  VFR_HUD: heading, groundspeed (for dead reckoning)
+  GPS_RAW_INT: lat, lon, satellites (when available, for DR calibration)
+  SYS_STATUS: battery voltage, remaining
+  Rate: 1-10 Hz depending on message type
+
+JETSON → MESH RADIO (inter-agent, UDP):
+  BEARING_REPORT: 32 bytes at 1 Hz
+  TARGET_LOST: 24 bytes on event
+  AGENT_STATUS: 16 bytes at 0.5 Hz
+  Destination: GS (192.168.1.160) or other drone (192.168.3.x)
 ```
 
 ### 6.2 Decision Engine State Machine
