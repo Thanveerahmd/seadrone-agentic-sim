@@ -694,40 +694,60 @@ export default function App() {
     );
     recvRing.rotation.x = -Math.PI / 2; recvRing.visible = false; scene.add(recvRing);
 
-    // 3D FOV cone meshes (V-shaped vision)
-    function mkFovCone(color) {
-      var segments = 24;
-      var verts = [0, 0.1, 0]; // tip at origin
-      var indices = [];
-      for (var fi = 0; fi <= segments; fi++) {
-        var a = -FOV_HALF + (fi / segments) * FOV_ANGLE;
-        verts.push(SENSE_R * Math.cos(a), 0.1, SENSE_R * Math.sin(a));
-        if (fi > 0) indices.push(0, fi, fi + 1);
-      }
-      var geo = new THREE.BufferGeometry();
-      geo.setAttribute("position", new THREE.Float32BufferAttribute(verts, 3));
-      geo.setIndex(indices);
-      geo.computeVertexNormals();
-      var mat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: .1, side: THREE.DoubleSide });
-      var mesh = new THREE.Mesh(geo, mat);
-      // wireframe edge
-      var edgeVerts = [0, 0.12, 0];
-      for (var ei = 0; ei <= segments; ei++) {
-        var ea = -FOV_HALF + (ei / segments) * FOV_ANGLE;
-        edgeVerts.push(SENSE_R * Math.cos(ea), 0.12, SENSE_R * Math.sin(ea));
-      }
+    // 3D FOV cone — dynamic vertices updated each frame (matches 2D map exactly)
+    var fovSegs = 24;
+    function mkDynFov(color) {
+      // Fill mesh: tip + arc points
+      var fillVerts = new Float32Array((fovSegs + 2) * 3);
+      var fillIdx = [];
+      for (var fi = 1; fi <= fovSegs; fi++) fillIdx.push(0, fi, fi + 1);
+      var fillGeo = new THREE.BufferGeometry();
+      fillGeo.setAttribute("position", new THREE.BufferAttribute(fillVerts, 3));
+      fillGeo.setIndex(fillIdx);
+      var fillMat = new THREE.MeshBasicMaterial({ color: color, transparent: true, opacity: .1, side: THREE.DoubleSide });
+      var fillMesh = new THREE.Mesh(fillGeo, fillMat);
+      fillMesh.frustumCulled = false;
+      // Edge line: tip → arc → tip
+      var edgeVerts = new Float32Array((fovSegs + 3) * 3);
       var edgeGeo = new THREE.BufferGeometry();
-      edgeGeo.setAttribute("position", new THREE.Float32BufferAttribute(edgeVerts, 3));
-      var edgeLine = new THREE.LineLoop(edgeGeo, new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: .25 }));
-      var group = new THREE.Group();
-      group.add(mesh); group.add(edgeLine);
-      group.userData.mat = mat;
-      group.userData.edgeMat = edgeLine.material;
-      scene.add(group);
-      return group;
+      edgeGeo.setAttribute("position", new THREE.BufferAttribute(edgeVerts, 3));
+      edgeGeo.setDrawRange(0, fovSegs + 3);
+      var edgeMat = new THREE.LineBasicMaterial({ color: color, transparent: true, opacity: .25 });
+      var edgeLine = new THREE.Line(edgeGeo, edgeMat);
+      edgeLine.frustumCulled = false;
+      scene.add(fillMesh); scene.add(edgeLine);
+      return { fillMesh: fillMesh, fillGeo: fillGeo, fillMat: fillMat, edgeLine: edgeLine, edgeGeo: edgeGeo, edgeMat: edgeMat };
     }
-    var senseRingA = mkFovCone(0x0a8a5a);
-    var senseRingB = mkFovCone(0x4838d0);
+    var fovA = mkDynFov(0x0a8a5a);
+    var fovB = mkDynFov(0x4838d0);
+
+    // Update FOV cone vertices from world position and heading
+    function updateFovCone(fov, pos, heading, inRange, activeColor, yHeight) {
+      var fp = fov.fillGeo.attributes.position.array;
+      var ep = fov.edgeGeo.attributes.position.array;
+      // Tip at drone position
+      fp[0] = pos.x; fp[1] = yHeight; fp[2] = pos.z;
+      ep[0] = pos.x; ep[1] = yHeight + 0.02; ep[2] = pos.z;
+      // Arc points — use same math as 2D fovTriangle
+      for (var i = 0; i <= fovSegs; i++) {
+        var a = heading + (-FOV_HALF + (i / fovSegs) * FOV_ANGLE);
+        var px = pos.x + SENSE_R * Math.cos(a);
+        var pz = pos.z + SENSE_R * Math.sin(a);
+        var idx = (i + 1) * 3;
+        fp[idx] = px; fp[idx + 1] = yHeight; fp[idx + 2] = pz;
+        var eidx = (i + 1) * 3;
+        ep[eidx] = px; ep[eidx + 1] = yHeight + 0.02; ep[eidx + 2] = pz;
+      }
+      // Close edge back to tip
+      var lastIdx = (fovSegs + 2) * 3;
+      ep[lastIdx] = pos.x; ep[lastIdx + 1] = yHeight + 0.02; ep[lastIdx + 2] = pos.z;
+      fov.fillGeo.attributes.position.needsUpdate = true;
+      fov.edgeGeo.attributes.position.needsUpdate = true;
+      fov.fillMat.opacity = inRange ? .14 : .04;
+      fov.fillMat.color.setHex(inRange ? activeColor : 0x6a8a9a);
+      fov.edgeMat.opacity = inRange ? .4 : .12;
+      fov.edgeMat.color.setHex(inRange ? activeColor : 0x6a8a9a);
+    }
 
     // 3D lock-on indicators around target
     var lockRingA = new THREE.Mesh(
@@ -811,14 +831,18 @@ export default function App() {
       var rock = function(o) { return Math.sin(time * 1.6 + o) * .05 + Math.cos(time * 2.3 + o) * .025; };
       var pitch = function(o) { return Math.sin(time * 1.3 + o) * .03; };
 
+      // Boat rotation: heading = atan2(dz, dx) is angle from +X in world XZ plane
+      // Three.js rotation.y: after rotating by θ, +X direction becomes (cosθ, 0, -sinθ)
+      // We want the bow (+X local) to face (cos(heading), 0, sin(heading)) in world
+      // So: cosθ = cos(h) and -sinθ = sin(h) → θ = -heading
       dA.position.set(st.aP.x, bob(0), st.aP.z);
-      dA.rotation.y = Math.atan2(st.tg.x - st.aP.x, st.tg.z - st.aP.z);
+      dA.rotation.y = st.aHeading != null ? -st.aHeading : 0;
       dA.rotation.z = rock(0);
       dA.rotation.x = pitch(0);
       dA.userData.rings.forEach(function(r, i) { r.visible = st.aD; if (st.aD) r.material.opacity = (.18 - i * .04) * (.7 + .3 * Math.sin(time * 2 + i)); });
 
       dB.position.set(st.bP.x, bob(1.5), st.bP.z);
-      dB.rotation.y = Math.atan2(st.tg.x - st.bP.x, st.tg.z - st.bP.z);
+      dB.rotation.y = st.bHeading != null ? -st.bHeading : 0;
       dB.rotation.z = rock(1.5);
       dB.rotation.x = pitch(1.5);
       dB.userData.rings.forEach(function(r, i) { r.visible = st.bD; if (st.bD) r.material.opacity = (.18 - i * .04) * (.7 + .3 * Math.sin(time * 2 + i + 1)); });
@@ -827,22 +851,14 @@ export default function App() {
       var fleeing = st.pi >= 2 && !stopped;
       tgt.rotation.z = fleeing ? Math.sin(time * 3.5 + 3) * .1 : rock(3);
       tgt.rotation.x = fleeing ? Math.sin(time * 2.8) * .06 : pitch(3);
-      if (!stopped) { var tp = curSc.tAt(Math.max(0, tk - 3)); tgt.rotation.y = Math.atan2(st.tg.x - tp.x, st.tg.z - tp.z); }
+      if (!stopped) {
+        var tp = curSc.tAt(Math.max(0, tk - 3));
+        tgt.rotation.y = -Math.atan2(st.tg.z - tp.z, st.tg.x - tp.x);
+      }
 
-      // 3D FOV cones — position, rotate to heading, color by detection
-      senseRingA.position.set(st.aP.x, 0, st.aP.z);
-      senseRingA.rotation.y = st.aHeading != null ? -st.aHeading + Math.PI / 2 : 0;
-      senseRingA.userData.mat.opacity = st.aInRange ? .15 : .05;
-      senseRingA.userData.mat.color.setHex(st.aInRange ? 0x0a8a5a : 0x6a8a9a);
-      senseRingA.userData.edgeMat.opacity = st.aInRange ? .4 : .12;
-      senseRingA.userData.edgeMat.color.setHex(st.aInRange ? 0x0a8a5a : 0x6a8a9a);
-
-      senseRingB.position.set(st.bP.x, 0, st.bP.z);
-      senseRingB.rotation.y = st.bHeading != null ? -st.bHeading + Math.PI / 2 : 0;
-      senseRingB.userData.mat.opacity = st.bInRange ? .15 : .05;
-      senseRingB.userData.mat.color.setHex(st.bInRange ? 0x4838d0 : 0x6a8a9a);
-      senseRingB.userData.edgeMat.opacity = st.bInRange ? .4 : .12;
-      senseRingB.userData.edgeMat.color.setHex(st.bInRange ? 0x4838d0 : 0x6a8a9a);
+      // 3D FOV cones — rebuild vertices from world coords (same math as 2D map)
+      if (st.aHeading != null) updateFovCone(fovA, st.aP, st.aHeading, st.aInRange, 0x0a8a5a, 0.12);
+      if (st.bHeading != null) updateFovCone(fovB, st.bP, st.bHeading, st.bInRange, 0x4838d0, 0.12);
 
       // Lock-on rings around target — spinning, pulsing when in range
       lockRingA.visible = st.aInRange;
