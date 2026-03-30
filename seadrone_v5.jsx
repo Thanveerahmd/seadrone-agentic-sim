@@ -471,11 +471,162 @@ function Map2D({ tick, scenario }) {
   );
 }
 
+// ════════════════════════════════════════════════════
+// IMU TELEMETRY PANEL
+// ════════════════════════════════════════════════════
+var TICK_DT = 65 / TOTAL;
+
+function IMUPanel({ label, color, pos, heading, speed, roll, pitch, bearing, dist, inRange }) {
+  var hdg = ((heading * 180 / Math.PI) + 360) % 360;
+  var brg = ((bearing * 180 / Math.PI) + 360) % 360;
+  var rl = (roll * 180 / Math.PI).toFixed(1);
+  var pt = (pitch * 180 / Math.PI).toFixed(1);
+  var gs = { display: "grid", gridTemplateColumns: "50px 1fr", gap: "1px 6px", lineHeight: "14px" };
+  return (
+    <div style={{ width: 200, background: "#0a1520e8", color: "#8ab0c8", padding: "5px 7px", borderRadius: "0 0 4px 4px", border: "1px solid " + color + "30", borderTop: "none", fontSize: 9, fontFamily: "monospace" }}>
+      <div style={gs}>
+        <span>HDG</span><span style={{ color: "#e0f0ff" }}>{hdg.toFixed(1)}°</span>
+        <span>SPD</span><span style={{ color: "#e0f0ff" }}>{speed.toFixed(1)} m/s</span>
+        <span>POS</span><span style={{ color: "#e0f0ff" }}>{pos.x.toFixed(1)}, {pos.z.toFixed(1)}</span>
+        <span>ROLL</span><span style={{ color: "#e0f0ff" }}>{rl}°</span>
+        <span>PITCH</span><span style={{ color: "#e0f0ff" }}>{pt}°</span>
+        <span>BRG</span><span style={{ color: inRange ? "#ffd700" : "#e0f0ff" }}>{brg.toFixed(1)}°</span>
+        <span>DIST</span><span style={{ color: inRange ? "#ffd700" : "#e0f0ff" }}>{dist.toFixed(1)}m</span>
+      </div>
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════
+// FPV CAMERA HUD OVERLAY
+// ════════════════════════════════════════════════════
+function FPVOverlay({ heading, inRange, dist, color }) {
+  var hdg = ((heading * 180 / Math.PI) + 360) % 360;
+  return (
+    <div style={{ position: "absolute", top: 0, left: 0, width: "100%", height: "100%", pointerEvents: "none" }}>
+      <svg width="100%" height="100%" viewBox="0 0 200 140" preserveAspectRatio="xMidYMid meet" style={{ position: "absolute", top: 0, left: 0 }}>
+        <line x1="90" y1="70" x2="110" y2="70" stroke="#0f0" strokeWidth="1" opacity=".5" />
+        <line x1="100" y1="60" x2="100" y2="80" stroke="#0f0" strokeWidth="1" opacity=".5" />
+        <circle cx="100" cy="70" r="18" fill="none" stroke="#0f0" strokeWidth=".5" opacity=".3" />
+        <circle cx="100" cy="70" r="6" fill="none" stroke="#0f0" strokeWidth=".5" opacity=".4" />
+      </svg>
+      <div style={{ position: "absolute", top: 2, width: "100%", textAlign: "center", fontSize: 9, color: "#0f0", opacity: .7, textShadow: "0 0 4px #000" }}>
+        HDG {hdg.toFixed(0)}°
+      </div>
+      {inRange && <div style={{ position: "absolute", bottom: 3, width: "100%", textAlign: "center", fontSize: 10, color: "#ffd700", fontWeight: 700, textShadow: "0 0 6px #000" }}>
+        TARGET LOCKED — {dist.toFixed(0)}m
+      </div>}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════
+// INSTRUCTION SHARING LOG
+// ════════════════════════════════════════════════════
+function getInstructions(scenarioId, sc, tick) {
+  var st = sc.posAt(tick);
+  var pi = st.pi, lt = st.lt;
+  var msgs = [];
+  var brg = function(from, to) { return (((Math.atan2(to.z - from.z, to.x - from.x) * 180 / Math.PI) + 360) % 360).toFixed(0); };
+  var dst = function(a, b) { return d3(a, b).toFixed(0); };
+
+  if (pi === 0) {
+    msgs.push({ from: "CMD", to: "A,B", c: "#1a80c0", text: "DEPLOY to search grid. A: sector NW, B: sector NE" });
+  } else if (pi === 1) {
+    msgs.push({ from: "A", to: "CMD", c: "#0a8a5a", text: "Search pattern active. No contact." });
+    msgs.push({ from: "B", to: "CMD", c: "#4838d0", text: "Search pattern active. No contact." });
+  } else if (scenarioId === "s1") {
+    if (pi === 2 && !st.commAB) {
+      msgs.push({ from: "A", to: "CMD", c: "#c89020", text: "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m. Pursuing." });
+      msgs.push({ from: "B", to: "CMD", c: "#4838d0", text: "Searching. No contact." });
+    } else if (pi === 2 && st.commAB) {
+      msgs.push({ from: "A", to: "B", c: "#20d090", text: "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.aP, st.tg) + "°. Intercept!" });
+      msgs.push({ from: "B", to: "A", c: "#4838d0", text: "ACK. Proceeding to intercept zone." });
+    } else if (pi === 3) {
+      msgs.push({ from: "A", to: "B", c: "#20d090", text: "Updated pos (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Close from opposite BRG." });
+      if (lt > 0.65) msgs.push({ from: "B", to: "A", c: "#4838d0", text: "Visual contact. Dual lock confirmed." });
+    } else if (pi >= 4) {
+      msgs.push({ from: "A", to: "B", c: "#c06020", text: "TRIANGULATE. Maintain 180° sep. Orbit R:" + OR + "m." });
+      msgs.push({ from: "B", to: "A", c: "#c06020", text: "Copy. Target contained." });
+    }
+  } else {
+    // Scenario 2
+    if (pi === 2 && !st.commAB) {
+      msgs.push({ from: "A", to: "CMD", c: "#c89020", text: "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m. Tracking." });
+    } else if (pi === 2 && st.commAB) {
+      msgs.push({ from: "A", to: "B", c: "#20d090", text: "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Navigate to area." });
+      msgs.push({ from: "B", to: "A", c: "#4838d0", text: "ACK. En route." });
+    } else if (pi === 3) {
+      msgs.push({ from: "A", to: "CMD", c: "#c03030", text: "LOST CONTACT. Last known (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Re-searching." });
+      msgs.push({ from: "CMD", to: "B", c: "#1a80c0", text: "A lost contact. Proceed to last known area." });
+    } else if (pi === 4) {
+      msgs.push({ from: "B", to: "A", c: "#6050e0", text: "CONTACT re-acquired (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.bP, st.tg) + "°. Navigate to me." });
+      if (lt > 0.5) msgs.push({ from: "A", to: "B", c: "#0a8a5a", text: "ACK. Visual acquired." });
+    } else if (pi >= 5) {
+      msgs.push({ from: "A", to: "B", c: "#c06020", text: "TRIANGULATE. 180° sep. Orbit R:" + OR + "m." });
+      msgs.push({ from: "B", to: "A", c: "#c06020", text: "Copy. Contained." });
+    }
+  }
+  return msgs;
+}
+
+function InstructionLog({ messages }) {
+  return (
+    <div style={{ width: 310, background: "#0a1520e0", borderRadius: 6, padding: "6px 8px", border: "1px solid #20d09030", fontSize: 9, fontFamily: "monospace" }}>
+      <div style={{ fontWeight: 700, color: "#20d090", marginBottom: 3, fontSize: 8, letterSpacing: 1 }}>INTER-DRONE COMM</div>
+      {messages.map(function(m, i) {
+        return <div key={i} style={{ padding: "2px 0", borderBottom: "1px solid #ffffff08", color: m.c || "#8ab0c8" }}>
+          <span style={{ fontWeight: 700, color: "#e0f0ff" }}>[{m.from}→{m.to}]</span> {m.text}
+        </div>;
+      })}
+    </div>
+  );
+}
+
+// ════════════════════════════════════════════════════
+// PATH OPTIMIZATION PANEL
+// ════════════════════════════════════════════════════
+function PathOptPanel({ st, triangPhaseIdx }) {
+  if (st.pi < triangPhaseIdx) return null;
+  var angA = Math.atan2(st.aP.z - st.tg.z, st.aP.x - st.tg.x);
+  var angB = Math.atan2(st.bP.z - st.tg.z, st.bP.x - st.tg.x);
+  var sep = Math.abs(angA - angB);
+  if (sep > Math.PI) sep = 2 * Math.PI - sep;
+  var sepDeg = sep * 180 / Math.PI;
+  var gdop = 1 / Math.max(Math.sin(sep / 2), 0.01);
+  var rA = d3(st.aP, st.tg), rB = d3(st.bP, st.tg);
+  var quality = gdop < 1.2 ? "OPTIMAL" : gdop < 2 ? "GOOD" : "CONVERGING";
+  var qCol = gdop < 1.2 ? "#0a8a5a" : gdop < 2 ? "#c89020" : "#c06020";
+  return (
+    <div style={{ background: "#0a1520e0", borderRadius: 6, padding: "6px 8px", border: "1px solid #c0602030", fontSize: 9, fontFamily: "monospace", color: "#8ab0c8" }}>
+      <div style={{ fontWeight: 700, color: "#c06020", marginBottom: 3, fontSize: 8, letterSpacing: 1 }}>TRIANGULATION OPT</div>
+      <div style={{ display: "grid", gridTemplateColumns: "65px 1fr", gap: "1px 6px", lineHeight: "14px" }}>
+        <span>ANG SEP</span><span style={{ color: "#e0f0ff" }}>{sepDeg.toFixed(1)}° / 180°</span>
+        <span>GDOP</span><span style={{ color: qCol, fontWeight: 700 }}>{gdop.toFixed(2)} {quality}</span>
+        <span>ORBIT A</span><span style={{ color: "#e0f0ff" }}>{rA.toFixed(1)}m / {OR}m</span>
+        <span>ORBIT B</span><span style={{ color: "#e0f0ff" }}>{rB.toFixed(1)}m / {OR}m</span>
+      </div>
+      <svg width="120" height="50" style={{ marginTop: 3 }}>
+        <circle cx="60" cy="28" r="3" fill="#d03030" />
+        <line x1="60" y1="28" x2={60 + 25 * Math.cos(angA)} y2={28 - 25 * Math.sin(angA)} stroke="#0a8a5a" strokeWidth="2" />
+        <line x1="60" y1="28" x2={60 + 25 * Math.cos(angB)} y2={28 - 25 * Math.sin(angB)} stroke="#4838d0" strokeWidth="2" />
+        <text x={60 + 28 * Math.cos(angA)} y={28 - 28 * Math.sin(angA)} style={{ fontSize: 8, fill: "#0a8a5a" }}>A</text>
+        <text x={60 + 28 * Math.cos(angB)} y={28 - 28 * Math.sin(angB)} style={{ fontSize: 8, fill: "#4838d0" }}>B</text>
+        <text x="60" y="8" textAnchor="middle" style={{ fontSize: 9, fill: qCol, fontWeight: 700 }}>{sepDeg.toFixed(0)}°</text>
+      </svg>
+    </div>
+  );
+}
+
 // ── MAIN ──
 export default function App() {
   var mountRef = useRef(null);
+  var fpvARef = useRef(null);
+  var fpvBRef = useRef(null);
+  var fpvBigRef = useRef(null);
   var initDone = useRef(false);
   var [scenarioId, setScenarioId] = useState("s1");
+  var [expandedFpv, setExpandedFpv] = useState(null); // null, "a", or "b"
   var [tick, setTick] = useState(0);
   var [playing, setPlaying] = useState(false);
   var [speed, setSpeed] = useState(1);
@@ -489,6 +640,10 @@ export default function App() {
 
   tickRef.current = tick;
   scenarioRef.current = scenarioId;
+  // Sync expanded FPV state to the ref in the 3D closure
+  if (mountRef.current && mountRef.current._expandedRef) {
+    mountRef.current._expandedRef.current = expandedFpv;
+  }
 
   // 3D Scene - one-time init
   useEffect(function() {
@@ -1024,7 +1179,100 @@ export default function App() {
       camera.position.set(lookX + camD * Math.sin(camPh) * Math.sin(camTh), camD * Math.cos(camPh), lookZ + camD * Math.sin(camPh) * Math.cos(camTh));
       camera.lookAt(lookX, 0, lookZ);
       renderer.render(scene, camera);
+
+      // FPV camera renders — hide own boat, position camera at bow tip with clear forward view
+      if (fpvRendererA && fpvRendererB) {
+        var fpvEye = 2.5, fpvFwd = 4.0, fpvLD = 40;
+
+        // Drone A FPV — hide A's model, render, restore
+        var aH = st.aHeading || 0;
+        dA.visible = false;
+        fpvCamA.position.set(
+          st.aP.x + fpvFwd * Math.cos(aH),
+          fpvEye,
+          st.aP.z + fpvFwd * Math.sin(aH)
+        );
+        fpvCamA.lookAt(
+          st.aP.x + fpvLD * Math.cos(aH),
+          0.5,
+          st.aP.z + fpvLD * Math.sin(aH)
+        );
+        fpvRendererA.render(scene, fpvCamA);
+        dA.visible = true;
+
+        // Drone B FPV — hide B's model, render, restore
+        var bH = st.bHeading || 0;
+        dB.visible = false;
+        fpvCamB.position.set(
+          st.bP.x + fpvFwd * Math.cos(bH),
+          fpvEye,
+          st.bP.z + fpvFwd * Math.sin(bH)
+        );
+        fpvCamB.lookAt(
+          st.bP.x + fpvLD * Math.cos(bH),
+          0.5,
+          st.bP.z + fpvLD * Math.sin(bH)
+        );
+        fpvRendererB.render(scene, fpvCamB);
+        dB.visible = true;
+      }
+
+      // Expanded (big) FPV render — lazily create renderer when canvas appears
+      var expRef = el._expandedRef;
+      if (expRef && expRef.current && fpvBigRef.current) {
+        // Lazy init
+        if (!el._fpvBigRenderer) {
+          el._fpvBigRenderer = new THREE.WebGLRenderer({ canvas: fpvBigRef.current, antialias: true });
+          el._fpvBigRenderer.setSize(el._fpvBigW, el._fpvBigH);
+          el._fpvBigRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+          el._fpvBigRenderer.setClearColor(0x87ceeb);
+          el._fpvBigCam = new THREE.PerspectiveCamera(55, el._fpvBigW / el._fpvBigH, 0.5, 300);
+        }
+        var bigR = el._fpvBigRenderer, bigC = el._fpvBigCam;
+        var expH2 = expRef.current === "a" ? (st.aHeading || 0) : (st.bHeading || 0);
+        var expP = expRef.current === "a" ? st.aP : st.bP;
+        var expBoat = expRef.current === "a" ? dA : dB;
+        expBoat.visible = false;
+        bigC.position.set(expP.x + fpvFwd * Math.cos(expH2), fpvEye, expP.z + fpvFwd * Math.sin(expH2));
+        bigC.lookAt(expP.x + fpvLD * Math.cos(expH2), 0.5, expP.z + fpvLD * Math.sin(expH2));
+        bigR.render(scene, bigC);
+        expBoat.visible = true;
+      } else if (el._fpvBigRenderer && (!expRef || !expRef.current)) {
+        // Dispose when closed to free resources
+        el._fpvBigRenderer.dispose();
+        el._fpvBigRenderer = null;
+        el._fpvBigCam = null;
+      }
     }
+
+    // FPV renderers (share scene, small resolution, no shadows)
+    var fpvW = 200, fpvHt = 140;
+    var fpvRendererA = null, fpvRendererB = null, fpvCamA = null, fpvCamB = null;
+    if (fpvARef.current && fpvBRef.current) {
+      fpvRendererA = new THREE.WebGLRenderer({ canvas: fpvARef.current, antialias: false });
+      fpvRendererA.setSize(fpvW, fpvHt);
+      fpvRendererA.setPixelRatio(1);
+      fpvRendererA.setClearColor(0x87ceeb);
+
+      fpvRendererB = new THREE.WebGLRenderer({ canvas: fpvBRef.current, antialias: false });
+      fpvRendererB.setSize(fpvW, fpvHt);
+      fpvRendererB.setPixelRatio(1);
+      fpvRendererB.setClearColor(0x87ceeb);
+
+      fpvCamA = new THREE.PerspectiveCamera(60, fpvW / fpvHt, 0.5, 200);
+      fpvCamB = new THREE.PerspectiveCamera(60, fpvW / fpvHt, 0.5, 200);
+    }
+
+    // Big FPV renderer — created lazily when canvas appears
+    var bigW = 640, bigH = 400;
+    var expandedRef = { current: null };
+    el._expandedRef = expandedRef;
+    el._fpvBigRenderer = null;
+    el._fpvBigCam = null;
+    el._fpvBigW = bigW;
+    el._fpvBigH = bigH;
+    el._scene = scene;
+
     animate();
   }, []);
 
@@ -1084,6 +1332,21 @@ export default function App() {
   var ph = sc.PHASES[phase.i];
   var ts = tick >= sc.PE[sc.triangPhaseIdx];
   var st = sc.posAt(tick);
+
+  // Derived IMU data
+  var prevSt = tick > 0 ? sc.posAt(tick - 1) : st;
+  var aSpeed = d3(st.aP, prevSt.aP) / TICK_DT;
+  var bSpeed = d3(st.bP, prevSt.bP) / TICK_DT;
+  var now = Date.now() * 0.001;
+  var aRoll = Math.sin(now * 1.6) * 0.05 + Math.cos(now * 2.3) * 0.025;
+  var aPitch = Math.sin(now * 1.3) * 0.03;
+  var bRoll = Math.sin(now * 1.6 + 1.5) * 0.05 + Math.cos(now * 2.3 + 1.5) * 0.025;
+  var bPitch = Math.sin(now * 1.3 + 1.5) * 0.03;
+  var aBearing = Math.atan2(st.tg.z - st.aP.z, st.tg.x - st.aP.x);
+  var bBearing = Math.atan2(st.tg.z - st.bP.z, st.tg.x - st.bP.x);
+  var aDist = d3(st.aP, st.tg), bDist = d3(st.bP, st.tg);
+  var instructions = getInstructions(scenarioId, sc, tick);
+
   var btn = { border: "none", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 11, borderRadius: 6, padding: "7px 18px" };
 
   return (
@@ -1107,6 +1370,57 @@ export default function App() {
         <div ref={mountRef} style={{ flex: 1, cursor: "grab", position: "relative", background: "#eef3f8", minWidth: 0 }}>
           <div style={{ position: "absolute", top: 8, left: 10, fontSize: 9, fontWeight: 700, color: "#0a8a5a", background: "#f8fafbdd", padding: "2px 8px", borderRadius: 4, border: "1px solid #e0e8f0", zIndex: 1 }}>3D VIEW</div>
           <div style={{ position: "absolute", bottom: 8, left: 10, fontSize: 8, color: "#a0b0c0", zIndex: 1 }}>Drag · Scroll</div>
+
+          {/* Drone A — FPV + IMU (top-left) */}
+          <div style={{ position: "absolute", top: 30, left: 10, zIndex: 2, cursor: "pointer" }} onClick={function() { setExpandedFpv(expandedFpv === "a" ? null : "a"); }}>
+            <div style={{ fontSize: 8, fontWeight: 700, color: "#0a8a5a", background: "#0a1520e8", padding: "2px 6px", borderRadius: "4px 4px 0 0", letterSpacing: 1, borderBottom: "1px solid #0a8a5a40", display: "flex", justifyContent: "space-between" }}>
+              <span>DRONE A — FPV</span><span style={{ color: "#6a8a9a", fontSize: 7 }}>{expandedFpv === "a" ? "▼ CLOSE" : "▲ EXPAND"}</span>
+            </div>
+            <div style={{ position: "relative" }}>
+              <canvas ref={fpvARef} width={200} height={140} style={{ display: "block", borderLeft: "2px solid #0a8a5a40", borderRight: "2px solid #0a8a5a40" }} />
+              <FPVOverlay heading={st.aHeading || 0} inRange={st.aInRange} dist={aDist} color="#0a8a5a" />
+            </div>
+            <IMUPanel label="A" color="#0a8a5a" pos={st.aP} heading={st.aHeading || 0} speed={aSpeed} roll={aRoll} pitch={aPitch} bearing={aBearing} dist={aDist} inRange={st.aInRange} />
+          </div>
+
+          {/* Drone B — FPV + IMU (top-right) */}
+          <div style={{ position: "absolute", top: 30, right: 10, zIndex: 2, cursor: "pointer" }} onClick={function() { setExpandedFpv(expandedFpv === "b" ? null : "b"); }}>
+            <div style={{ fontSize: 8, fontWeight: 700, color: "#4838d0", background: "#0a1520e8", padding: "2px 6px", borderRadius: "4px 4px 0 0", letterSpacing: 1, borderBottom: "1px solid #4838d040", display: "flex", justifyContent: "space-between" }}>
+              <span>DRONE B — FPV</span><span style={{ color: "#6a8a9a", fontSize: 7 }}>{expandedFpv === "b" ? "▼ CLOSE" : "▲ EXPAND"}</span>
+            </div>
+            <div style={{ position: "relative" }}>
+              <canvas ref={fpvBRef} width={200} height={140} style={{ display: "block", borderLeft: "2px solid #4838d040", borderRight: "2px solid #4838d040" }} />
+              <FPVOverlay heading={st.bHeading || 0} inRange={st.bInRange} dist={bDist} color="#4838d0" />
+            </div>
+            <IMUPanel label="B" color="#4838d0" pos={st.bP} heading={st.bHeading || 0} speed={bSpeed} roll={bRoll} pitch={bPitch} bearing={bBearing} dist={bDist} inRange={st.bInRange} />
+          </div>
+
+          {/* Expanded FPV overlay */}
+          {expandedFpv && <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", zIndex: 10 }} onClick={function(e) { e.stopPropagation(); }}>
+            <div style={{ background: "#0a1520", borderRadius: 8, border: "2px solid " + (expandedFpv === "a" ? "#0a8a5a" : "#4838d0"), overflow: "hidden", boxShadow: "0 8px 32px #000a" }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", padding: "4px 10px", background: "#0a1520" }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: expandedFpv === "a" ? "#0a8a5a" : "#4838d0", letterSpacing: 1 }}>
+                  DRONE {expandedFpv.toUpperCase()} — CAMERA FEED
+                </span>
+                <span onClick={function() { setExpandedFpv(null); }} style={{ fontSize: 10, color: "#6a8a9a", cursor: "pointer", padding: "2px 8px", borderRadius: 3, background: "#ffffff10" }}>CLOSE</span>
+              </div>
+              <div style={{ position: "relative" }}>
+                <canvas ref={fpvBigRef} width={640} height={400} style={{ display: "block" }} />
+                <FPVOverlay heading={expandedFpv === "a" ? (st.aHeading || 0) : (st.bHeading || 0)} inRange={expandedFpv === "a" ? st.aInRange : st.bInRange} dist={expandedFpv === "a" ? aDist : bDist} color={expandedFpv === "a" ? "#0a8a5a" : "#4838d0"} />
+              </div>
+              <div style={{ padding: "4px 10px 6px", background: "#0a1520", display: "flex", gap: 16, fontSize: 10, fontFamily: "monospace", color: "#8ab0c8" }}>
+                <span>HDG <span style={{ color: "#e0f0ff" }}>{(((expandedFpv === "a" ? st.aHeading : st.bHeading) * 180 / Math.PI + 360) % 360).toFixed(1)}°</span></span>
+                <span>SPD <span style={{ color: "#e0f0ff" }}>{(expandedFpv === "a" ? aSpeed : bSpeed).toFixed(1)} m/s</span></span>
+                <span>BRG <span style={{ color: (expandedFpv === "a" ? st.aInRange : st.bInRange) ? "#ffd700" : "#e0f0ff" }}>{(((expandedFpv === "a" ? aBearing : bBearing) * 180 / Math.PI + 360) % 360).toFixed(1)}°</span></span>
+                <span>DIST <span style={{ color: (expandedFpv === "a" ? st.aInRange : st.bInRange) ? "#ffd700" : "#e0f0ff" }}>{(expandedFpv === "a" ? aDist : bDist).toFixed(1)}m</span></span>
+              </div>
+            </div>
+          </div>}
+
+          {/* Instruction Comm Log (bottom-left) */}
+          <div style={{ position: "absolute", bottom: 28, left: 10, zIndex: 2 }}>
+            <InstructionLog messages={instructions} />
+          </div>
         </div>
         {/* Draggable divider */}
         <div
@@ -1129,8 +1443,12 @@ export default function App() {
           background: "#fafcfe",
           display: "flex", flexDirection: "column", gap: 6
         }}>
-          <span style={{ fontSize: 10, fontWeight: 700, color: "#1a80c0", letterSpacing: .8 }}>SPATIAL MAP</span>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <span style={{ fontSize: 10, fontWeight: 700, color: "#1a80c0", letterSpacing: .8 }}>SPATIAL MAP</span>
+            {st.pi >= sc.triangPhaseIdx && <span style={{ fontSize: 8, fontWeight: 700, color: "#c06020", background: "#c0602015", padding: "2px 6px", borderRadius: 3 }}>TRIANG ACTIVE</span>}
+          </div>
           <Map2D tick={tick} scenario={sc} />
+          <PathOptPanel st={st} triangPhaseIdx={sc.triangPhaseIdx} />
           <div style={{ display: "flex", gap: 10, fontSize: 9, color: "#6a7a8a" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #0a8a5a" }} />A</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #4838d0" }} />B</span>
