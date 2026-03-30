@@ -3,13 +3,36 @@ import * as THREE from "three";
 
 const TOTAL = 960;
 const OR = 22;
-const SENSE_R = 35; // FOV range (distance)
-const FOV_ANGLE = Math.PI / 3; // 60° total cone (30° each side)
+const SENSE_R = 35;
+const FOV_ANGLE = Math.PI / 3;
 const FOV_HALF = FOV_ANGLE / 2;
+
+// Ground Station
+var GS_POS = { x: 0, z: -55 };
+var PROTOCOLS = {
+  D2D: { id: "D2D", name: "Drone-to-Drone (D2D)", color: "#20d090", latency: 12, bw: 0.8, desc: "Direct mesh link between drones" },
+  D2G: { id: "D2G", name: "Drone-Ground-Drone (D2G)", color: "#f0a030", latency: 45, bw: 2.4, desc: "Relay via ground station orchestrator" }
+};
 
 function lr(a, b, t) { return a + (b - a) * Math.max(0, Math.min(1, t)); }
 function eIO(t) { return t < .5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2; }
 function d3(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2); }
+
+// Compute comm link quality for the selected protocol
+function commState(aP, bP, commAB, commBA, proto) {
+  var dAB = d3(aP, bP), dAG = d3(aP, GS_POS), dBG = d3(bP, GS_POS);
+  var hasComm = commAB || commBA;
+  var sigAB = Math.max(0, 1 - dAB / 80);
+  var sigAG = Math.max(0, 1 - dAG / 150);
+  var sigBG = Math.max(0, 1 - dBG / 150);
+  var latency = 0, bw = 0;
+  if (hasComm) {
+    if (proto === "D2D") { latency = PROTOCOLS.D2D.latency + (1 - sigAB) * 25; bw = PROTOCOLS.D2D.bw * Math.max(sigAB, 0.1); }
+    else { latency = PROTOCOLS.D2G.latency + (1 - sigAG) * 30 + (1 - sigBG) * 30; bw = PROTOCOLS.D2G.bw * Math.min(Math.max(sigAG, 0.1), Math.max(sigBG, 0.1)); }
+  }
+  var route = !hasComm ? "---" : proto === "D2D" ? (commAB ? "A→B" : "B→A") : (commAB ? "A→GS→B" : "B→GS→A");
+  return { proto: proto, dAB: dAB, dAG: dAG, dBG: dBG, sigAB: sigAB, sigAG: sigAG, sigBG: sigBG, latency: latency, bw: bw, route: route, hasComm: hasComm };
+}
 
 // Check if target is inside a drone's V-shaped FOV cone
 // dronePos: {x,z}, droneHeading: angle in radians, targetPos: {x,z}
@@ -327,7 +350,7 @@ function getScenario(id) {
 }
 
 // 2D Map - pure SVG, no state, just reads tick
-function Map2D({ tick, scenario }) {
+function Map2D({ tick, scenario, proto }) {
   var s = scenario.posAt(tick);
   var ts = tick >= scenario.PE[scenario.triangPhaseIdx];
   var SC = 4.5;
@@ -417,21 +440,47 @@ function Map2D({ tick, scenario }) {
         </g>;
       })()}
 
-      {/* Comm link A→B */}
-      {s.commAB && <line x1={cx(s.aP.x)} y1={cy(s.aP.z)} x2={cx(s.bP.x)} y2={cy(s.bP.z)} stroke="#20d090" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />}
-      {s.commAB && [0, .25, .5, .75].map(function(off, ci) {
-        var ct = ((tick * .008 + off) % 1);
-        return <circle key={"cp" + ci} cx={lr(cx(s.aP.x), cx(s.bP.x), ct)} cy={lr(cy(s.aP.z), cy(s.bP.z), ct)} r={3 + 2 * Math.sin(ct * Math.PI)} fill="#20d090" opacity={.7 * Math.sin(ct * Math.PI)} />;
-      })}
-      {s.commAB && <text x={(cx(s.aP.x) + cx(s.bP.x)) / 2} y={(cy(s.aP.z) + cy(s.bP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "10px", fill: "#20d090", fontFamily: "monospace", fontWeight: 700 }}>A→B</text>}
+      {/* Ground Station icon */}
+      <rect x={cx(GS_POS.x) - 9} y={cy(GS_POS.z) - 9} width="18" height="18" rx="3" fill="#1a2a3a" stroke="#f0a030" strokeWidth="1.5" />
+      <text x={cx(GS_POS.x)} y={cy(GS_POS.z) + 4} textAnchor="middle" style={{ fontSize: "9px", fill: "#f0a030", fontFamily: "monospace", fontWeight: 700 }}>GS</text>
+      <text x={cx(GS_POS.x)} y={cy(GS_POS.z) + 24} textAnchor="middle" style={{ fontSize: "7px", fill: "#8a6a2a", fontFamily: "monospace" }}>GROUND STN</text>
 
-      {/* Comm link B→A */}
-      {s.commBA && <line x1={cx(s.bP.x)} y1={cy(s.bP.z)} x2={cx(s.aP.x)} y2={cy(s.aP.z)} stroke="#6050e0" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />}
-      {s.commBA && [0, .25, .5, .75].map(function(off, ci) {
-        var ct = ((tick * .008 + off) % 1);
-        return <circle key={"cpb" + ci} cx={lr(cx(s.bP.x), cx(s.aP.x), ct)} cy={lr(cy(s.bP.z), cy(s.aP.z), ct)} r={3 + 2 * Math.sin(ct * Math.PI)} fill="#6050e0" opacity={.7 * Math.sin(ct * Math.PI)} />;
-      })}
-      {s.commBA && <text x={(cx(s.aP.x) + cx(s.bP.x)) / 2} y={(cy(s.aP.z) + cy(s.bP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "10px", fill: "#6050e0", fontFamily: "monospace", fontWeight: 700 }}>B→A</text>}
+      {/* Protocol-aware comm links */}
+      {(function() {
+        var hasComm = s.commAB || s.commBA;
+        if (!hasComm) return null;
+        var txP = s.commAB ? s.aP : s.bP;
+        var rxP = s.commAB ? s.bP : s.aP;
+        var txLabel = s.commAB ? "A" : "B";
+        var rxLabel = s.commAB ? "B" : "A";
+
+        if (proto === "D2D") {
+          return <g>
+            <line x1={cx(txP.x)} y1={cy(txP.z)} x2={cx(rxP.x)} y2={cy(rxP.z)} stroke="#20d090" strokeWidth="2" opacity=".35" />
+            {[0, .25, .5, .75].map(function(off, ci) {
+              var ct = ((tick * .012 + off) % 1);
+              return <circle key={"d2d" + ci} cx={lr(cx(txP.x), cx(rxP.x), ct)} cy={lr(cy(txP.z), cy(rxP.z), ct)} r={3 + 2 * Math.sin(ct * Math.PI)} fill="#20d090" opacity={.8 * Math.sin(ct * Math.PI)} />;
+            })}
+            <text x={(cx(txP.x) + cx(rxP.x)) / 2} y={(cy(txP.z) + cy(rxP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "9px", fill: "#20d090", fontFamily: "monospace", fontWeight: 700 }}>D2D {txLabel}→{rxLabel}</text>
+          </g>;
+        } else {
+          return <g>
+            {/* TX → GS */}
+            <line x1={cx(txP.x)} y1={cy(txP.z)} x2={cx(GS_POS.x)} y2={cy(GS_POS.z)} stroke="#f0a030" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />
+            {[0, .33, .66].map(function(off, ci) {
+              var ct = ((tick * .006 + off) % 1);
+              return <circle key={"d2g1" + ci} cx={lr(cx(txP.x), cx(GS_POS.x), ct)} cy={lr(cy(txP.z), cy(GS_POS.z), ct)} r={2.5 + 1.5 * Math.sin(ct * Math.PI)} fill="#f0a030" opacity={.7 * Math.sin(ct * Math.PI)} />;
+            })}
+            {/* GS → RX */}
+            <line x1={cx(GS_POS.x)} y1={cy(GS_POS.z)} x2={cx(rxP.x)} y2={cy(rxP.z)} stroke="#f0a030" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />
+            {[0, .33, .66].map(function(off, ci) {
+              var ct = ((tick * .006 + off + .15) % 1);
+              return <circle key={"d2g2" + ci} cx={lr(cx(GS_POS.x), cx(rxP.x), ct)} cy={lr(cy(GS_POS.z), cy(rxP.z), ct)} r={2.5 + 1.5 * Math.sin(ct * Math.PI)} fill="#f0a030" opacity={.7 * Math.sin(ct * Math.PI)} />;
+            })}
+            <text x={cx(GS_POS.x)} y={cy(GS_POS.z) - 16} textAnchor="middle" style={{ fontSize: "9px", fill: "#f0a030", fontFamily: "monospace", fontWeight: 700 }}>RELAY {txLabel}→GS→{rxLabel}</text>
+          </g>;
+        }
+      })()}
 
       {/* Triangulation orbit + link */}
       {s.pi >= 5 && <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r={OR * SC} fill="none" stroke="#0a8a5a" strokeWidth="1" opacity=".15" strokeDasharray="6 6" />}
@@ -523,48 +572,58 @@ function FPVOverlay({ heading, inRange, dist, color }) {
 // ════════════════════════════════════════════════════
 // INSTRUCTION SHARING LOG
 // ════════════════════════════════════════════════════
-function getInstructions(scenarioId, sc, tick) {
+function getInstructions(scenarioId, sc, tick, proto) {
   var st = sc.posAt(tick);
   var pi = st.pi, lt = st.lt;
   var msgs = [];
   var brg = function(from, to) { return (((Math.atan2(to.z - from.z, to.x - from.x) * 180 / Math.PI) + 360) % 360).toFixed(0); };
   var dst = function(a, b) { return d3(a, b).toFixed(0); };
+  var pc = PROTOCOLS[proto].color;
+  var tag = "[" + proto + "] ";
+
+  // Helper: route a message from drone X to drone Y through the selected protocol
+  function relay(from, to, text) {
+    if (proto === "D2D") {
+      msgs.push({ from: from, to: to, c: "#20d090", text: tag + text });
+    } else {
+      msgs.push({ from: from, to: "GS", c: "#f0a030", text: tag + text });
+      msgs.push({ from: "GS", to: to, c: "#f0a030", text: "RELAY: " + text });
+    }
+  }
 
   if (pi === 0) {
-    msgs.push({ from: "CMD", to: "A,B", c: "#1a80c0", text: "DEPLOY to search grid. A: sector NW, B: sector NE" });
+    msgs.push({ from: "GS", to: "A,B", c: "#f0a030", text: "DEPLOY to search grid. A: sector NW, B: sector NE" });
   } else if (pi === 1) {
-    msgs.push({ from: "A", to: "CMD", c: "#0a8a5a", text: "Search pattern active. No contact." });
-    msgs.push({ from: "B", to: "CMD", c: "#4838d0", text: "Search pattern active. No contact." });
+    msgs.push({ from: "A", to: "GS", c: "#0a8a5a", text: tag + "Search pattern active. No contact." });
+    msgs.push({ from: "B", to: "GS", c: "#4838d0", text: tag + "Search pattern active. No contact." });
   } else if (scenarioId === "s1") {
     if (pi === 2 && !st.commAB) {
-      msgs.push({ from: "A", to: "CMD", c: "#c89020", text: "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m. Pursuing." });
-      msgs.push({ from: "B", to: "CMD", c: "#4838d0", text: "Searching. No contact." });
+      msgs.push({ from: "A", to: "GS", c: "#c89020", text: tag + "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m. Pursuing." });
     } else if (pi === 2 && st.commAB) {
-      msgs.push({ from: "A", to: "B", c: "#20d090", text: "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.aP, st.tg) + "°. Intercept!" });
-      msgs.push({ from: "B", to: "A", c: "#4838d0", text: "ACK. Proceeding to intercept zone." });
+      relay("A", "B", "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.aP, st.tg) + "°. Intercept!");
+      relay("B", "A", "ACK. Proceeding to intercept zone.");
     } else if (pi === 3) {
-      msgs.push({ from: "A", to: "B", c: "#20d090", text: "Updated pos (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Close from opposite BRG." });
-      if (lt > 0.65) msgs.push({ from: "B", to: "A", c: "#4838d0", text: "Visual contact. Dual lock confirmed." });
+      relay("A", "B", "Updated pos (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Close from opposite BRG.");
+      if (lt > 0.65) relay("B", "A", "Visual contact. Dual lock confirmed.");
     } else if (pi >= 4) {
-      msgs.push({ from: "A", to: "B", c: "#c06020", text: "TRIANGULATE. Maintain 180° sep. Orbit R:" + OR + "m." });
-      msgs.push({ from: "B", to: "A", c: "#c06020", text: "Copy. Target contained." });
+      relay("A", "B", "TRIANGULATE. Maintain 180° sep. Orbit R:" + OR + "m.");
+      relay("B", "A", "Copy. Target contained.");
     }
   } else {
-    // Scenario 2
     if (pi === 2 && !st.commAB) {
-      msgs.push({ from: "A", to: "CMD", c: "#c89020", text: "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m. Tracking." });
+      msgs.push({ from: "A", to: "GS", c: "#c89020", text: tag + "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m." });
     } else if (pi === 2 && st.commAB) {
-      msgs.push({ from: "A", to: "B", c: "#20d090", text: "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Navigate to area." });
-      msgs.push({ from: "B", to: "A", c: "#4838d0", text: "ACK. En route." });
+      relay("A", "B", "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Navigate to area.");
+      relay("B", "A", "ACK. En route.");
     } else if (pi === 3) {
-      msgs.push({ from: "A", to: "CMD", c: "#c03030", text: "LOST CONTACT. Last known (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Re-searching." });
-      msgs.push({ from: "CMD", to: "B", c: "#1a80c0", text: "A lost contact. Proceed to last known area." });
+      msgs.push({ from: "A", to: "GS", c: "#c03030", text: tag + "LOST CONTACT. Last known (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + ")." });
+      msgs.push({ from: "GS", to: "B", c: "#f0a030", text: "A lost contact. Proceed to last known area." });
     } else if (pi === 4) {
-      msgs.push({ from: "B", to: "A", c: "#6050e0", text: "CONTACT re-acquired (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.bP, st.tg) + "°. Navigate to me." });
-      if (lt > 0.5) msgs.push({ from: "A", to: "B", c: "#0a8a5a", text: "ACK. Visual acquired." });
+      relay("B", "A", "CONTACT re-acquired (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.bP, st.tg) + "°.");
+      if (lt > 0.5) relay("A", "B", "ACK. Visual acquired.");
     } else if (pi >= 5) {
-      msgs.push({ from: "A", to: "B", c: "#c06020", text: "TRIANGULATE. 180° sep. Orbit R:" + OR + "m." });
-      msgs.push({ from: "B", to: "A", c: "#c06020", text: "Copy. Contained." });
+      relay("A", "B", "TRIANGULATE. 180° sep. Orbit R:" + OR + "m.");
+      relay("B", "A", "Copy. Contained.");
     }
   }
   return msgs;
@@ -618,6 +677,58 @@ function PathOptPanel({ st, triangPhaseIdx }) {
   );
 }
 
+// ════════════════════════════════════════════════════
+// COMM DASHBOARD
+// ════════════════════════════════════════════════════
+function CommDashboard({ comm, proto }) {
+  var pc = PROTOCOLS[proto];
+  function sigBar(val, color) {
+    var bars = 5;
+    return <div style={{ display: "inline-flex", gap: 1, verticalAlign: "middle", marginLeft: 4 }}>
+      {Array.from({ length: bars }, function(_, i) {
+        var filled = val > (i / bars);
+        return <div key={i} style={{ width: 4, height: 6 + i * 2, background: filled ? color : "#333", borderRadius: 1 }} />;
+      })}
+    </div>;
+  }
+  var pCol = pc.color;
+  return (
+    <div style={{ background: "#0a1520e0", borderRadius: 6, padding: "6px 8px", border: "1px solid " + pCol + "30", fontSize: 9, fontFamily: "monospace", color: "#8ab0c8" }}>
+      <div style={{ fontWeight: 700, color: pCol, marginBottom: 4, fontSize: 8, letterSpacing: 1 }}>COMM DASHBOARD — {pc.id}</div>
+      <div style={{ marginBottom: 4, color: "#6a8a9a", fontSize: 8 }}>{pc.desc}</div>
+      <div style={{ display: "grid", gridTemplateColumns: "55px 1fr", gap: "2px 6px", lineHeight: "15px" }}>
+        <span>ROUTE</span><span style={{ color: "#e0f0ff", fontWeight: 700 }}>{comm.route}</span>
+        <span>LATENCY</span><span style={{ color: comm.latency < 30 ? "#20d090" : comm.latency < 70 ? "#c89020" : "#c06020" }}>{comm.hasComm ? comm.latency.toFixed(0) + "ms" : "---"}</span>
+        <span>BW</span><span style={{ color: "#e0f0ff" }}>{comm.hasComm ? comm.bw.toFixed(2) + " Mbps" : "---"}</span>
+      </div>
+      <div style={{ marginTop: 4, fontSize: 8, color: "#6a8a9a" }}>LINK QUALITY</div>
+      <div style={{ display: "grid", gridTemplateColumns: "40px 1fr", gap: "2px 4px", lineHeight: "16px", marginTop: 2 }}>
+        {proto === "D2D" && <><span>A↔B</span><span>{sigBar(comm.sigAB, "#20d090")} <span style={{ color: "#e0f0ff" }}>{comm.dAB.toFixed(0)}m</span></span></>}
+        {proto === "D2G" && <>
+          <span>A↔GS</span><span>{sigBar(comm.sigAG, "#f0a030")} <span style={{ color: "#e0f0ff" }}>{comm.dAG.toFixed(0)}m</span></span>
+          <span>B↔GS</span><span>{sigBar(comm.sigBG, "#f0a030")} <span style={{ color: "#e0f0ff" }}>{comm.dBG.toFixed(0)}m</span></span>
+        </>}
+      </div>
+      {/* Mini topology */}
+      <svg width="140" height="40" style={{ marginTop: 4 }}>
+        <circle cx="15" cy="20" r="7" fill={comm.hasComm ? "#0a8a5a" : "#333"} stroke="#0a8a5a" strokeWidth=".5" />
+        <text x="15" y="23" textAnchor="middle" style={{ fontSize: 7, fill: "#fff", fontWeight: 700 }}>A</text>
+        <circle cx="125" cy="20" r="7" fill={comm.hasComm ? "#4838d0" : "#333"} stroke="#4838d0" strokeWidth=".5" />
+        <text x="125" y="23" textAnchor="middle" style={{ fontSize: 7, fill: "#fff", fontWeight: 700 }}>B</text>
+        {proto === "D2G" && <>
+          <rect x="60" y="12" width="16" height="16" rx="2" fill={comm.hasComm ? "#f0a030" : "#333"} stroke="#f0a030" strokeWidth=".5" />
+          <text x="68" y="23" textAnchor="middle" style={{ fontSize: 6, fill: "#fff", fontWeight: 700 }}>GS</text>
+          <line x1="22" y1="20" x2="60" y2="20" stroke={comm.hasComm ? "#f0a030" : "#333"} strokeWidth="1.5" strokeDasharray="3 2" />
+          <line x1="76" y1="20" x2="118" y2="20" stroke={comm.hasComm ? "#f0a030" : "#333"} strokeWidth="1.5" strokeDasharray="3 2" />
+        </>}
+        {proto === "D2D" && <line x1="22" y1="20" x2="118" y2="20" stroke={comm.hasComm ? "#20d090" : "#333"} strokeWidth="2" />}
+        {proto === "D2D" && <text x="70" y="10" textAnchor="middle" style={{ fontSize: 7, fill: "#20d090" }}>DIRECT</text>}
+        {proto === "D2G" && <text x="68" y="8" textAnchor="middle" style={{ fontSize: 7, fill: "#f0a030" }}>RELAY</text>}
+      </svg>
+    </div>
+  );
+}
+
 // ── MAIN ──
 export default function App() {
   var mountRef = useRef(null);
@@ -626,6 +737,8 @@ export default function App() {
   var fpvBigRef = useRef(null);
   var initDone = useRef(false);
   var [scenarioId, setScenarioId] = useState("s1");
+  var [commProto, setCommProto] = useState("D2G");
+  var [mapFull, setMapFull] = useState(false);
   var [expandedFpv, setExpandedFpv] = useState(null); // null, "a", or "b"
   var [tick, setTick] = useState(0);
   var [playing, setPlaying] = useState(false);
@@ -640,6 +753,8 @@ export default function App() {
 
   tickRef.current = tick;
   scenarioRef.current = scenarioId;
+  var protoRef = useRef(commProto);
+  protoRef.current = commProto;
   // Sync expanded FPV state to the ref in the 3D closure
   if (mountRef.current && mountRef.current._expandedRef) {
     mountRef.current._expandedRef.current = expandedFpv;
@@ -798,6 +913,29 @@ export default function App() {
     var dA = mkBoat(0x18a070, 0x22c888, 0x0a8a5a); scene.add(dA);
     var dB = mkBoat(0x3030b0, 0x4848d8, 0x4838d0); scene.add(dB);
     var tgt = mkBoat(0xc03030, 0xe04040, 0xd03030); scene.add(tgt);
+
+    // Ground Station 3D model
+    var gsGroup = new THREE.Group();
+    var gsPlatform = new THREE.Mesh(new THREE.BoxGeometry(4, 0.8, 4), new THREE.MeshStandardMaterial({ color: 0x2a3a4a, roughness: 0.4, metalness: 0.6 }));
+    gsPlatform.position.y = 0.4; gsPlatform.castShadow = true; gsGroup.add(gsPlatform);
+    var gsMast = new THREE.Mesh(new THREE.CylinderGeometry(0.06, 0.08, 4, 8), new THREE.MeshStandardMaterial({ color: 0x888888, metalness: 0.9, roughness: 0.2 }));
+    gsMast.position.y = 2.8; gsGroup.add(gsMast);
+    var gsDish = new THREE.Mesh(new THREE.ConeGeometry(1.0, 0.6, 16), new THREE.MeshStandardMaterial({ color: 0xf0a030, metalness: 0.7, roughness: 0.3 }));
+    gsDish.position.y = 4.2; gsDish.rotation.x = Math.PI; gsGroup.add(gsDish);
+    var gsBeacon = new THREE.Mesh(new THREE.SphereGeometry(0.2, 8, 8), new THREE.MeshBasicMaterial({ color: 0xf0a030, transparent: true }));
+    gsBeacon.position.y = 5.0; gsGroup.add(gsBeacon);
+    gsGroup.position.set(GS_POS.x, 0, GS_POS.z);
+    scene.add(gsGroup);
+
+    // D2G relay beam objects (TX→GS and GS→RX)
+    var d2gBeam1 = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineDashedMaterial({ color: 0xf0a030, transparent: true, opacity: .4, dashSize: 1, gapSize: 1.5 }));
+    d2gBeam1.visible = false; scene.add(d2gBeam1);
+    var d2gBeam2 = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineDashedMaterial({ color: 0xf0a030, transparent: true, opacity: .4, dashSize: 1, gapSize: 1.5 }));
+    d2gBeam2.visible = false; scene.add(d2gBeam2);
+    var d2gPkts = [];
+    for (var dp = 0; dp < 6; dp++) { var dpm = new THREE.Mesh(new THREE.OctahedronGeometry(0.3), new THREE.MeshBasicMaterial({ color: 0xf0a030, transparent: true, opacity: 0.9 })); dpm.visible = false; scene.add(dpm); d2gPkts.push(dpm); }
+    var gsRelayRings = [];
+    for (var gr = 0; gr < 3; gr++) { var grm = new THREE.Mesh(new THREE.RingGeometry(1, 1.3, 32), new THREE.MeshBasicMaterial({ color: 0xf0a030, transparent: true, opacity: .3, side: THREE.DoubleSide })); grm.rotation.x = -Math.PI / 2; grm.visible = false; scene.add(grm); gsRelayRings.push(grm); }
 
     function mkLine(c, o) {
       var l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: o }));
@@ -1104,54 +1242,97 @@ export default function App() {
         pkt2.position.set(lr(st.bP.x, st.aP.x, (pp + .5) % 1), 2.2, lr(st.bP.z, st.aP.z, (pp + .5) % 1));
       } else { pkt2.visible = false; }
 
-      // Comm signals — A→B or B→A
+      // GS beacon blink
+      gsBeacon.material.opacity = Math.sin(time * 3) > 0 ? 1 : 0.2;
+      gsDish.rotation.y = time * 0.5; // slow radar rotation
+
+      // Protocol-aware 3D comm signals
       var hasComm = st.commAB || st.commBA;
-      if (hasComm) {
-        var txPos = st.commAB ? st.aP : st.bP; // transmitter
-        var rxPos = st.commAB ? st.bP : st.aP; // receiver
-        var commColor = st.commAB ? 0x20d090 : 0x6050e0;
+      var curProto = protoRef.current;
+      var txPos = st.commAB ? st.aP : st.bP;
+      var rxPos = st.commAB ? st.bP : st.aP;
 
+      if (hasComm && curProto === "D2D") {
+        // D2D: direct beam between drones (cyan)
         commBeam.visible = true;
-        commBeam.material.color.setHex(commColor);
+        commBeam.material.color.setHex(0x20d090);
         var cbp = commBeam.geometry.attributes.position;
-        cbp.setXYZ(0, txPos.x, 2.5, txPos.z);
-        cbp.setXYZ(1, rxPos.x, 2.5, rxPos.z);
-        cbp.needsUpdate = true;
+        cbp.setXYZ(0, txPos.x, 2.5, txPos.z); cbp.setXYZ(1, rxPos.x, 2.5, rxPos.z); cbp.needsUpdate = true;
         commBeam.computeLineDistances();
-        commBeam.material.opacity = .2 + .15 * Math.sin(time * 3);
-
+        commBeam.material.opacity = .25 + .15 * Math.sin(time * 3);
         for (var ci = 0; ci < commPkts.length; ci++) {
           var ct = ((time * .8 + ci * .25) % 1);
-          commPkts[ci].visible = true;
-          commPkts[ci].material.color.setHex(commColor);
+          commPkts[ci].visible = true; commPkts[ci].material.color.setHex(0x20d090);
           commPkts[ci].position.set(lr(txPos.x, rxPos.x, ct), 2.5 + Math.sin(ct * Math.PI) * 1.2, lr(txPos.z, rxPos.z, ct));
           commPkts[ci].material.opacity = .9 * Math.sin(ct * Math.PI);
-          var cs = .25 + .2 * Math.sin(ct * Math.PI);
-          commPkts[ci].scale.set(cs * 3, cs * 3, cs * 3);
+          var cs = .25 + .2 * Math.sin(ct * Math.PI); commPkts[ci].scale.set(cs * 3, cs * 3, cs * 3);
         }
-
         for (var si = 0; si < sigRings.length; si++) {
-          sigRings[si].visible = true;
-          sigRings[si].material.color.setHex(commColor);
+          sigRings[si].visible = true; sigRings[si].material.color.setHex(0x20d090);
           sigRings[si].position.set(txPos.x, 2.6, txPos.z);
-          var sp = ((time * 1.2 + si * .33) % 1);
-          var sr2 = 1 + sp * 5;
-          sigRings[si].scale.set(sr2, sr2, sr2);
-          sigRings[si].material.opacity = .35 * (1 - sp);
+          var sp = ((time * 1.2 + si * .33) % 1); var sr2 = 1 + sp * 5;
+          sigRings[si].scale.set(sr2, sr2, sr2); sigRings[si].material.opacity = .35 * (1 - sp);
         }
-
-        recvRing.visible = true;
-        recvRing.material.color.setHex(commColor);
+        recvRing.visible = true; recvRing.material.color.setHex(0x20d090);
         recvRing.position.set(rxPos.x, 2.0, rxPos.z);
-        var rp = ((time * 1.5) % 1);
-        var rr = 1 + rp * 3;
-        recvRing.scale.set(rr, rr, rr);
-        recvRing.material.opacity = .3 * (1 - rp);
-      } else {
+        var rp = ((time * 1.5) % 1); var rr = 1 + rp * 3;
+        recvRing.scale.set(rr, rr, rr); recvRing.material.opacity = .3 * (1 - rp);
+        // Hide D2G objects
+        d2gBeam1.visible = false; d2gBeam2.visible = false;
+        for (var dp = 0; dp < d2gPkts.length; dp++) d2gPkts[dp].visible = false;
+        for (var gri = 0; gri < gsRelayRings.length; gri++) gsRelayRings[gri].visible = false;
+
+      } else if (hasComm && curProto === "D2G") {
+        // D2G: relay through ground station (amber)
         commBeam.visible = false;
-        for (var ci2 = 0; ci2 < commPkts.length; ci2++) commPkts[ci2].visible = false;
-        for (var si2 = 0; si2 < sigRings.length; si2++) sigRings[si2].visible = false;
+        for (var ci3 = 0; ci3 < commPkts.length; ci3++) commPkts[ci3].visible = false;
+        // Leg 1: TX → GS
+        d2gBeam1.visible = true;
+        var l1p = d2gBeam1.geometry.attributes.position;
+        l1p.setXYZ(0, txPos.x, 2.5, txPos.z); l1p.setXYZ(1, GS_POS.x, 4.5, GS_POS.z); l1p.needsUpdate = true;
+        d2gBeam1.computeLineDistances(); d2gBeam1.material.opacity = .25 + .1 * Math.sin(time * 2);
+        // Leg 2: GS → RX
+        d2gBeam2.visible = true;
+        var l2p = d2gBeam2.geometry.attributes.position;
+        l2p.setXYZ(0, GS_POS.x, 4.5, GS_POS.z); l2p.setXYZ(1, rxPos.x, 2.5, rxPos.z); l2p.needsUpdate = true;
+        d2gBeam2.computeLineDistances(); d2gBeam2.material.opacity = .25 + .1 * Math.sin(time * 2 + 1);
+        // D2G packets (3 per leg, slower, diamond shape)
+        for (var di = 0; di < 3; di++) {
+          var ct1 = ((time * .5 + di * .33) % 1);
+          d2gPkts[di].visible = true;
+          d2gPkts[di].position.set(lr(txPos.x, GS_POS.x, ct1), lr(2.5, 4.5, ct1) + Math.sin(ct1 * Math.PI) * 0.8, lr(txPos.z, GS_POS.z, ct1));
+          d2gPkts[di].material.opacity = .8 * Math.sin(ct1 * Math.PI);
+          var ct2 = ((time * .5 + di * .33 + .15) % 1);
+          d2gPkts[di + 3].visible = true;
+          d2gPkts[di + 3].position.set(lr(GS_POS.x, rxPos.x, ct2), lr(4.5, 2.5, ct2) + Math.sin(ct2 * Math.PI) * 0.8, lr(GS_POS.z, rxPos.z, ct2));
+          d2gPkts[di + 3].material.opacity = .8 * Math.sin(ct2 * Math.PI);
+        }
+        // GS relay pulse rings
+        for (var gri2 = 0; gri2 < gsRelayRings.length; gri2++) {
+          gsRelayRings[gri2].visible = true; gsRelayRings[gri2].position.set(GS_POS.x, 4.0, GS_POS.z);
+          var gsp = ((time * 1.0 + gri2 * .33) % 1); var gsr = 1 + gsp * 4;
+          gsRelayRings[gri2].scale.set(gsr, gsr, gsr); gsRelayRings[gri2].material.opacity = .3 * (1 - gsp);
+        }
+        // TX/RX signal rings (amber)
+        for (var si2 = 0; si2 < sigRings.length; si2++) {
+          sigRings[si2].visible = true; sigRings[si2].material.color.setHex(0xf0a030);
+          sigRings[si2].position.set(txPos.x, 2.6, txPos.z);
+          var sp2 = ((time * 1.2 + si2 * .33) % 1); var sr3 = 1 + sp2 * 5;
+          sigRings[si2].scale.set(sr3, sr3, sr3); sigRings[si2].material.opacity = .35 * (1 - sp2);
+        }
+        recvRing.visible = true; recvRing.material.color.setHex(0xf0a030);
+        recvRing.position.set(rxPos.x, 2.0, rxPos.z);
+        var rp2 = ((time * 1.5) % 1); var rr2 = 1 + rp2 * 3;
+        recvRing.scale.set(rr2, rr2, rr2); recvRing.material.opacity = .3 * (1 - rp2);
+
+      } else {
+        // No comm — hide everything
+        commBeam.visible = false; d2gBeam1.visible = false; d2gBeam2.visible = false;
+        for (var ci4 = 0; ci4 < commPkts.length; ci4++) commPkts[ci4].visible = false;
+        for (var dp2 = 0; dp2 < d2gPkts.length; dp2++) d2gPkts[dp2].visible = false;
+        for (var si3 = 0; si3 < sigRings.length; si3++) sigRings[si3].visible = false;
         recvRing.visible = false;
+        for (var gri3 = 0; gri3 < gsRelayRings.length; gri3++) gsRelayRings[gri3].visible = false;
       }
 
       // 3D trails
@@ -1180,41 +1361,33 @@ export default function App() {
       camera.lookAt(lookX, 0, lookZ);
       renderer.render(scene, camera);
 
-      // FPV camera renders — hide own boat, position camera at bow tip with clear forward view
+      // FPV camera renders — hide own boat + all comm objects for clean camera feed
       if (fpvRendererA && fpvRendererB) {
         var fpvEye = 2.5, fpvFwd = 4.0, fpvLD = 40;
 
-        // Drone A FPV — hide A's model, render, restore
+        // Collect all comm objects to hide during FPV
+        var commObjs = [commBeam, d2gBeam1, d2gBeam2, recvRing].concat(commPkts, d2gPkts, sigRings, gsRelayRings);
+        var commVis = commObjs.map(function(o) { return o.visible; });
+        commObjs.forEach(function(o) { o.visible = false; });
+
+        // Drone A FPV
         var aH = st.aHeading || 0;
         dA.visible = false;
-        fpvCamA.position.set(
-          st.aP.x + fpvFwd * Math.cos(aH),
-          fpvEye,
-          st.aP.z + fpvFwd * Math.sin(aH)
-        );
-        fpvCamA.lookAt(
-          st.aP.x + fpvLD * Math.cos(aH),
-          0.5,
-          st.aP.z + fpvLD * Math.sin(aH)
-        );
+        fpvCamA.position.set(st.aP.x + fpvFwd * Math.cos(aH), fpvEye, st.aP.z + fpvFwd * Math.sin(aH));
+        fpvCamA.lookAt(st.aP.x + fpvLD * Math.cos(aH), 0.5, st.aP.z + fpvLD * Math.sin(aH));
         fpvRendererA.render(scene, fpvCamA);
         dA.visible = true;
 
-        // Drone B FPV — hide B's model, render, restore
+        // Drone B FPV
         var bH = st.bHeading || 0;
         dB.visible = false;
-        fpvCamB.position.set(
-          st.bP.x + fpvFwd * Math.cos(bH),
-          fpvEye,
-          st.bP.z + fpvFwd * Math.sin(bH)
-        );
-        fpvCamB.lookAt(
-          st.bP.x + fpvLD * Math.cos(bH),
-          0.5,
-          st.bP.z + fpvLD * Math.sin(bH)
-        );
+        fpvCamB.position.set(st.bP.x + fpvFwd * Math.cos(bH), fpvEye, st.bP.z + fpvFwd * Math.sin(bH));
+        fpvCamB.lookAt(st.bP.x + fpvLD * Math.cos(bH), 0.5, st.bP.z + fpvLD * Math.sin(bH));
         fpvRendererB.render(scene, fpvCamB);
         dB.visible = true;
+
+        // Restore comm object visibility
+        commObjs.forEach(function(o, idx) { o.visible = commVis[idx]; });
       }
 
       // Expanded (big) FPV render — lazily create renderer when canvas appears
@@ -1232,11 +1405,16 @@ export default function App() {
         var expH2 = expRef.current === "a" ? (st.aHeading || 0) : (st.bHeading || 0);
         var expP = expRef.current === "a" ? st.aP : st.bP;
         var expBoat = expRef.current === "a" ? dA : dB;
+        // Hide comm objects + own boat for clean expanded FPV
+        var bigCommObjs = [commBeam, d2gBeam1, d2gBeam2, recvRing].concat(commPkts, d2gPkts, sigRings, gsRelayRings);
+        var bigCommVis = bigCommObjs.map(function(o) { return o.visible; });
+        bigCommObjs.forEach(function(o) { o.visible = false; });
         expBoat.visible = false;
         bigC.position.set(expP.x + fpvFwd * Math.cos(expH2), fpvEye, expP.z + fpvFwd * Math.sin(expH2));
         bigC.lookAt(expP.x + fpvLD * Math.cos(expH2), 0.5, expP.z + fpvLD * Math.sin(expH2));
         bigR.render(scene, bigC);
         expBoat.visible = true;
+        bigCommObjs.forEach(function(o, idx) { o.visible = bigCommVis[idx]; });
       } else if (el._fpvBigRenderer && (!expRef || !expRef.current)) {
         // Dispose when closed to free resources
         el._fpvBigRenderer.dispose();
@@ -1345,7 +1523,8 @@ export default function App() {
   var aBearing = Math.atan2(st.tg.z - st.aP.z, st.tg.x - st.aP.x);
   var bBearing = Math.atan2(st.tg.z - st.bP.z, st.tg.x - st.bP.x);
   var aDist = d3(st.aP, st.tg), bDist = d3(st.bP, st.tg);
-  var instructions = getInstructions(scenarioId, sc, tick);
+  var comm = commState(st.aP, st.bP, st.commAB, st.commBA, commProto);
+  var instructions = getInstructions(scenarioId, sc, tick, commProto);
 
   var btn = { border: "none", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 11, borderRadius: 6, padding: "7px 18px" };
 
@@ -1360,6 +1539,9 @@ export default function App() {
         <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11 }}>
           <select value={scenarioId} onChange={function(e) { setScenarioId(e.target.value); setPlaying(false); setTick(0); scenarioCache = {}; }} style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 600, padding: "4px 8px", borderRadius: 5, border: "1px solid #d0dae4", background: "#f2f6f9", color: "#2a3a4a", cursor: "pointer" }}>
             {Object.values(SCENARIOS).map(function(s) { return <option key={s.id} value={s.id}>{s.name}</option>; })}
+          </select>
+          <select value={commProto} onChange={function(e) { setCommProto(e.target.value); }} style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 600, padding: "4px 8px", borderRadius: 5, border: "1px solid " + PROTOCOLS[commProto].color + "60", background: PROTOCOLS[commProto].color + "15", color: PROTOCOLS[commProto].color, cursor: "pointer" }}>
+            {Object.values(PROTOCOLS).map(function(p) { return <option key={p.id} value={p.id}>{p.name}</option>; })}
           </select>
           {(function() { var info = sc.statusText(st, phase, ts); return info ? <span style={{ color: info.color, fontWeight: 700 }}>{info.icon} {info.text}</span> : null; })()}
           <span style={{ color: "#b0bcc8", fontSize: 10 }}>T+{(tick / TOTAL * 65).toFixed(1)}s</span>
@@ -1445,17 +1627,28 @@ export default function App() {
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span style={{ fontSize: 10, fontWeight: 700, color: "#1a80c0", letterSpacing: .8 }}>SPATIAL MAP</span>
-            {st.pi >= sc.triangPhaseIdx && <span style={{ fontSize: 8, fontWeight: 700, color: "#c06020", background: "#c0602015", padding: "2px 6px", borderRadius: 3 }}>TRIANG ACTIVE</span>}
+            <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
+              {st.pi >= sc.triangPhaseIdx && <span style={{ fontSize: 8, fontWeight: 700, color: "#c06020", background: "#c0602015", padding: "2px 6px", borderRadius: 3 }}>TRIANG ACTIVE</span>}
+              <button onClick={function() { setMapFull(!mapFull); }} style={{ border: "1px solid #d0dae4", background: mapFull ? "#edf8f3" : "#f2f6f9", color: mapFull ? "#0a8a5a" : "#6a7a8a", cursor: "pointer", fontFamily: "monospace", fontSize: 9, fontWeight: 600, borderRadius: 4, padding: "2px 8px" }}>
+                {mapFull ? "Show Panels" : "Expand Map"}
+              </button>
+            </div>
           </div>
-          <Map2D tick={tick} scenario={sc} />
-          <PathOptPanel st={st} triangPhaseIdx={sc.triangPhaseIdx} />
-          <div style={{ display: "flex", gap: 10, fontSize: 9, color: "#6a7a8a" }}>
+          <Map2D tick={tick} scenario={sc} proto={commProto} />
+          {!mapFull && <div style={{ display: "flex", gap: 6 }}>
+            <div style={{ flex: 1 }}><CommDashboard comm={comm} proto={commProto} /></div>
+            <div style={{ flex: 1 }}><PathOptPanel st={st} triangPhaseIdx={sc.triangPhaseIdx} /></div>
+          </div>}
+          {!mapFull && <div style={{ display: "flex", gap: 10, fontSize: 9, color: "#6a7a8a", flexWrap: "wrap" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #0a8a5a" }} />A</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #4838d0" }} />B</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 7, height: 7, borderRadius: "50%", background: "#d03030" }} />Target</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 12, borderTop: "1.5px dashed #c89020" }} />Bearing</span>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "6px solid transparent", borderRight: "6px solid transparent", borderBottom: "10px solid #90a8b8", opacity: .5 }} />FOV</span>
-          </div>
+            <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 8, height: 8, background: "#1a2a3a", border: "1.5px solid #f0a030", borderRadius: 2 }} />GS</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 12, borderTop: "2px solid #20d090" }} />D2D</span>
+            <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 12, borderTop: "1.5px dashed #f0a030" }} />D2G</span>
+          </div>}
         </div>
       </div>
 
