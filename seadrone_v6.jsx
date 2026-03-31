@@ -1,24 +1,36 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import * as THREE from "three";
 
-const TOTAL = 960;
 const OR = 22;
-const SENSE_R = 35;
-const FOV_ANGLE = Math.PI / 3;
+const SENSE_R = 45; // detection range in meters
+const FOV_ANGLE = Math.PI * 0.55; // 100° FOV — wider camera for better detection
 const FOV_HALF = FOV_ANGLE / 2;
-
-// Ground Station
 var GS_POS = { x: 0, z: -55 };
 var PROTOCOLS = {
   D2D: { id: "D2D", name: "Drone-to-Drone (D2D)", color: "#20d090", latency: 12, bw: 0.8, desc: "Direct mesh link between drones" },
   D2G: { id: "D2G", name: "Drone-Ground-Drone (D2G)", color: "#f0a030", latency: 45, bw: 2.4, desc: "Relay via ground station orchestrator" }
 };
 
-function lr(a, b, t) { return a + (b - a) * Math.max(0, Math.min(1, t)); }
-function eIO(t) { return t < .5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2; }
-function d3(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2); }
+// ═══ V6: REAL-TIME SIMULATION CONSTANTS ═══
+var DRONE_MAX_SPEED = 3.5;
+var DRONE_TURN_RATE = 1.2; // rad/s
+var DRONE_ACCEL = 3.0;
+var TARGET_MAX_SPEED = 5.0;
+var TARGET_TURN_RATE = 1.8;
+var TARGET_ACCEL = 6.0;
+var DETECT_CONFIRM_TIME = 0.3; // seconds to confirm lock
+var LOST_TIMEOUT = 3.0; // seconds before declaring lost
+var RELAY_DELAY = 1.5; // seconds before partner reacts
+var TRAIL_INTERVAL = 0.15;
+var TRAIL_MAX = 800;
 
-// Compute comm link quality for the selected protocol
+// Playground boundary (meters from GS origin)
+var BOUNDS = { xMin: -100, xMax: 100, zMin: -70, zMax: 100 };
+
+function lr(a, b, t) { return a + (b - a) * Math.max(0, Math.min(1, t)); }
+function d3(a, b) { return Math.sqrt((a.x - b.x) ** 2 + (a.z - b.z) ** 2); }
+function normAng(a) { return ((a + Math.PI * 3) % (Math.PI * 2)) - Math.PI; }
+
 function commState(aP, bP, commAB, commBA, proto) {
   var dAB = d3(aP, bP), dAG = d3(aP, GS_POS), dBG = d3(bP, GS_POS);
   var hasComm = commAB || commBA;
@@ -34,338 +46,450 @@ function commState(aP, bP, commAB, commBA, proto) {
   return { proto: proto, dAB: dAB, dAG: dAG, dBG: dBG, sigAB: sigAB, sigAG: sigAG, sigBG: sigBG, latency: latency, bw: bw, route: route, hasComm: hasComm };
 }
 
-// Check if target is inside a drone's V-shaped FOV cone
-// dronePos: {x,z}, droneHeading: angle in radians, targetPos: {x,z}
 function inFOV(dronePos, droneHeading, targetPos) {
-  var dx = targetPos.x - dronePos.x;
-  var dz = targetPos.z - dronePos.z;
+  var dx = targetPos.x - dronePos.x, dz = targetPos.z - dronePos.z;
   var dist = Math.sqrt(dx * dx + dz * dz);
   if (dist > SENSE_R || dist < 0.5) return false;
-  var angleToTarget = Math.atan2(dz, dx);
-  var diff = angleToTarget - droneHeading;
-  // Normalize to [-PI, PI]
-  diff = ((diff + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+  var diff = normAng(Math.atan2(dz, dx) - droneHeading);
   return Math.abs(diff) <= FOV_HALF;
 }
 
-// Get drone heading from position and target/direction
-function droneHeading(dronePos, lookAt) {
-  return Math.atan2(lookAt.z - dronePos.z, lookAt.x - dronePos.x);
-}
-
-// Get the 3 points of the FOV triangle (for 2D rendering)
 function fovTriangle(pos, heading, range) {
-  var lAng = heading - FOV_HALF;
-  var rAng = heading + FOV_HALF;
   return {
     tip: pos,
-    left: { x: pos.x + range * Math.cos(lAng), z: pos.z + range * Math.sin(lAng) },
-    right: { x: pos.x + range * Math.cos(rAng), z: pos.z + range * Math.sin(rAng) }
+    left: { x: pos.x + range * Math.cos(heading - FOV_HALF), z: pos.z + range * Math.sin(heading - FOV_HALF) },
+    right: { x: pos.x + range * Math.cos(heading + FOV_HALF), z: pos.z + range * Math.sin(heading + FOV_HALF) }
   };
 }
 
 // ════════════════════════════════════════════════════
-// SCENARIO DEFINITIONS
+// V6: AUTONOMOUS DRONE AUTOPILOT
 // ════════════════════════════════════════════════════
 
-var SCENARIOS = {
-  s1: {
-    id: "s1",
-    name: "Scenario 1: Detect & Triangulate",
-    desc: "A detects target, relays to B, both triangulate",
-    phases: [
-      { id: "DEPLOY", label: "Deploy",     c: "#0a8a5a", dur: 20 },
-      { id: "SEARCH", label: "Search",     c: "#1a80c0", dur: 100 },
-      { id: "DETECT", label: "Detect",     c: "#c89020", dur: 140 },
-      { id: "RELAY",  label: "Relay",      c: "#c06020", dur: 180 },
-      { id: "TRIANG", label: "Triangulate",c: "#c03030", dur: 60 },
-      { id: "TRACK",  label: "Track",      c: "#0a8a5a", dur: 460 },
-    ],
-  },
-  s2: {
-    id: "s2",
-    name: "Scenario 2: Lose & Re-acquire",
-    desc: "A locks target, loses it, B re-acquires and relays back",
-    phases: [
-      { id: "DEPLOY",  label: "Deploy",     c: "#0a8a5a", dur: 20 },
-      { id: "SEARCH",  label: "Search",     c: "#1a80c0", dur: 100 },
-      { id: "A_LOCK",  label: "A Lock",     c: "#c89020", dur: 130 },
-      { id: "A_LOST",  label: "A Lost",     c: "#c03030", dur: 150 },
-      { id: "B_LOCK",  label: "B Lock",     c: "#4838d0", dur: 110 },
-      { id: "TRIANG",  label: "Triangulate",c: "#c06020", dur: 60 },
-      { id: "TRACK",   label: "Track",      c: "#0a8a5a", dur: 390 },
-    ],
+// Generate expanding spiral search from center outward, biased to assigned side
+function genSearchWaypoints(side) {
+  var wps = [];
+  var cx = side === "left" ? -30 : 30;
+  var cz = 20; // start from upper-center area (likely target zone)
+  var spacing = 18;
+  // Expanding square spiral: center → out
+  for (var ring = 0; ring < 6; ring++) {
+    var r = spacing * (ring + 1);
+    wps.push({ x: cx + r, z: cz + r });
+    wps.push({ x: cx - r, z: cz + r });
+    wps.push({ x: cx - r, z: cz - r });
+    wps.push({ x: cx + r, z: cz - r });
   }
-};
+  // Clamp to bounds
+  wps = wps.map(function(p) {
+    return { x: Math.max(BOUNDS.xMin + 5, Math.min(BOUNDS.xMax - 5, p.x)), z: Math.max(BOUNDS.zMin + 5, Math.min(BOUNDS.zMax - 5, p.z)) };
+  });
+  return wps;
+}
 
-// ── Build scenario runtime data ──
-function buildScenario(scen) {
-  var PHASES = scen.phases;
-  var PE = PHASES.reduce(function(a, p, i) { a.push((a[i - 1] || 0) + p.dur); return a; }, []);
-  var trackPhaseIdx = PHASES.length - 1;
-  var triangPhaseIdx = PHASES.length - 2;
+function initialDrone(id, x, z, side) {
+  return {
+    id: id, x: x, z: z, heading: Math.PI / 2, speed: 0,
+    state: "SEARCH", stateTime: 0,
+    searchWps: genSearchWaypoints(side), searchIdx: 0,
+    targetLastSeen: null, targetBearing: 0, targetDist: 999,
+    lostTimer: 0, detectTimer: 0, relayTimer: 0,
+    partnerTarget: null
+  };
+}
 
-  function gp(tk) {
-    var a = 0;
-    for (var i = 0; i < PHASES.length; i++) {
-      if (tk < a + PHASES[i].dur) return { i: i, t: (tk - a) / PHASES[i].dur };
-      a += PHASES[i].dur;
-    }
-    return { i: PHASES.length - 1, t: 1 };
-  }
+function initialSim() {
+  return {
+    target: { x: 0, z: 40, heading: Math.PI / 2, speed: 0 },
+    droneA: initialDrone("A", -3, -30, "left"),
+    droneB: initialDrone("B", 3, -30, "right"),
+    elapsed: 0, mode: "manual",
+    contained: false, containedTime: 0,
+    blasted: false, blastTime: 0,
+    commAB: false, commBA: false,
+    aTrail: [], bTrail: [], tTrail: [], trailTimer: 0
+  };
+}
 
-  // Search paths (shared by both scenarios)
-  function gSA(sx, sz, n) {
-    var p = [];
-    for (var i = 0; i <= n; i++) {
-      var t = i / n;
-      p.push({ x: sx - t * 40 + Math.sin(t * Math.PI * 2.4) * 5, z: sz + t * 52 + Math.sin(t * Math.PI * 1.6) * 4 });
-    }
-    return p;
-  }
-  function gSB(sx, sz, n) {
-    var p = [];
-    for (var i = 0; i <= n; i++) {
-      var t = i / n;
-      p.push({ x: sx + t * 55 + Math.sin(t * Math.PI * 2.4) * 5, z: sz + t * 42 + Math.sin(t * Math.PI * 1.6) * 4 });
-    }
-    var last = p[p.length - 1];
-    for (var j = 1; j <= 80; j++) {
-      var et = j / 80;
-      p.push({ x: last.x + et * 12 + Math.sin(et * Math.PI * 3) * 7, z: last.z + et * 20 - Math.cos(et * Math.PI * 2) * 6 });
-    }
-    return p;
-  }
-  var SA = gSA(-3, -26, 90);
-  var SB = gSB(3, -26, 90);
-  var bSearchEnd = 90;
-  var bTotalPts = SB.length - 1;
+function steerToward(drone, targetAngle, dt) {
+  var diff = normAng(targetAngle - drone.heading);
+  drone.heading += Math.sign(diff) * Math.min(Math.abs(diff), DRONE_TURN_RATE * dt);
+}
 
-  // ── Scenario 1 ──
-  if (scen.id === "s1") {
-    var DETECT_START = PE[1];
-    var tAt = function(tk) {
-      var stop = PE[triangPhaseIdx];
-      if (tk >= stop) return tAt(stop - 1);
-      var t = tk / stop;
-      if (tk < DETECT_START) {
-        return { x: -22 - t * 50 + Math.sin(t * Math.PI * 2) * 5, z: 28 - t * 20 + Math.cos(t * Math.PI * 1.5) * 4 };
+function stepDrone(drone, target, partner, sim, dt) {
+  var tPos = { x: target.x, z: target.z };
+  var canSee = inFOV({ x: drone.x, z: drone.z }, drone.heading, tPos);
+  var dist = d3({ x: drone.x, z: drone.z }, tPos);
+  drone.targetDist = dist;
+  drone.stateTime += dt;
+
+  switch (drone.state) {
+    case "SEARCH": {
+      // Navigate through search waypoints with scanning head movement
+      var wps = drone.searchWps || genSearchWaypoints(drone.id === "A" ? "left" : "right");
+      if (!drone.searchWps) { drone.searchWps = wps; drone.searchIdx = 0; }
+      if (wps.length > 0) {
+        var wp = wps[drone.searchIdx % wps.length];
+        var angToWp = Math.atan2(wp.z - drone.z, wp.x - drone.x);
+        // Add scanning sweep: oscillate heading ±40° around travel direction
+        var scanOffset = Math.sin(drone.stateTime * 1.8) * 0.7; // ~40° sweep
+        steerToward(drone, angToWp + scanOffset, dt);
+        drone.speed = Math.min(drone.speed + DRONE_ACCEL * dt, DRONE_MAX_SPEED * 0.7);
+        drone.x += Math.cos(drone.heading) * drone.speed * dt;
+        drone.z += Math.sin(drone.heading) * drone.speed * dt;
+        if (d3({ x: drone.x, z: drone.z }, wp) < 8) drone.searchIdx++;
       }
-      var dt = (tk - DETECT_START) / (stop - DETECT_START);
-      var t0 = DETECT_START / stop;
-      var bx = -22 - t0 * 50 + Math.sin(t0 * Math.PI * 2) * 5;
-      var bz = 28 - t0 * 20 + Math.cos(t0 * Math.PI * 1.5) * 4;
-      var fl = Math.min(dt * 1.5, 1);
-      var decay = 1 - dt * dt * 0.4;
-      return { x: bx + fl * 40 * decay + Math.sin(dt * Math.PI * 5) * 10 * fl * decay, z: bz - fl * 20 * decay + Math.cos(dt * Math.PI * 4.5) * 8 * fl * decay };
-    };
-    var posAt = function(tk) {
-      var r = gp(tk), pi = r.i, lt = r.t;
-      var tg = tAt(tk);
-      var aP = SA[0], bP = SB[0], aD = false, bD = false, cm = false, commAB = false, commBA = false;
-      if (pi === 0) {
-        aP = { x: lr(-3, SA[0].x, lt), z: lr(-30, SA[0].z, lt) };
-        bP = { x: lr(3, SB[0].x, lt), z: lr(-30, SB[0].z, lt) };
-      } else if (pi === 1) {
-        var ia = Math.min(Math.floor(lt * SA.length), SA.length - 1);
-        var ib = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
-        aP = SA[ia]; bP = SB[ib];
-      } else if (pi === 2) {
-        aD = true; cm = true;
-        var tgP = tAt(Math.max(0, tk - 4));
-        var fa = Math.atan2(tg.z - tgP.z, tg.x - tgP.x);
-        var ca = fa + Math.PI + lt * 0.6 - 0.3, cd = SENSE_R * 0.7 - lt * 4;
-        aP = { x: tg.x + cd * Math.cos(ca), z: tg.z + cd * Math.sin(ca) };
-        if (lt < 0.5) {
-          var bi = bSearchEnd + Math.min(Math.floor(lt / 0.5 * (bTotalPts - bSearchEnd)), bTotalPts - bSearchEnd);
-          bP = SB[bi];
-        } else {
-          commAB = true;
-          var bs = SB[bTotalPts], rt = (lt - 0.5) / 0.5, re = rt * rt * rt;
-          bP = { x: lr(bs.x, bs.x + (tg.x - bs.x) * 0.15, re), z: lr(bs.z, bs.z + (tg.z - bs.z) * 0.15, re) };
-        }
-      } else if (pi === 3) {
-        aD = true; cm = true; commAB = true;
-        var tgP2 = tAt(Math.max(0, tk - 4));
-        var fa2 = Math.atan2(tg.z - tgP2.z, tg.x - tgP2.x);
-        var ca2 = fa2 + Math.PI + lt * 1.0, cd2 = (SENSE_R * 0.7 - 4) - lt * 2;
-        aP = { x: tg.x + cd2 * Math.cos(ca2), z: tg.z + cd2 * Math.sin(ca2) };
-        var bSt = SB[bTotalPts];
-        var rawT = Math.max(0, (lt - 0.1) / 0.9);
-        var bE = rawT < 0.5 ? rawT * rawT * rawT / (0.5 * 0.5 * 0.5) * 0.35 : 0.35 + 0.65 * eIO((rawT - 0.5) / 0.5);
-        var bGA = ca2 + Math.PI;
-        var bG = { x: tg.x + OR * Math.cos(bGA), z: tg.z + OR * Math.sin(bGA) };
-        var bM = { x: (bSt.x + bG.x) / 2, z: (bSt.z + bG.z) / 2 + 10 };
-        var m = 1 - bE;
-        bP = { x: m * m * bSt.x + 2 * m * bE * bM.x + bE * bE * bG.x, z: m * m * bSt.z + 2 * m * bE * bM.z + bE * bE * bG.z };
-        if (lt > .65) bD = true;
+      // Check detection — instant lock when target is clearly in FOV
+      if (canSee) { drone.detectTimer += dt; } else { drone.detectTimer = Math.max(0, drone.detectTimer - dt * 0.3); }
+      if (drone.detectTimer > DETECT_CONFIRM_TIME) { drone.state = "CHASE"; drone.stateTime = 0; drone.lostTimer = 0; }
+      // Check if partner relayed target position
+      if (drone.partnerTarget) { drone.state = "INTERCEPT"; drone.stateTime = 0; }
+      break;
+    }
+    case "CHASE": {
+      // LOCKED ON TARGET — orbit at OR distance, always face target
+      // The drone KNOWS the target position — it doesn't rely on FOV to track
+      var angToTarget = Math.atan2(tPos.z - drone.z, tPos.x - drone.x);
+      drone.targetBearing = angToTarget;
+      drone.targetLastSeen = { x: tPos.x, z: tPos.z };
+
+      if (dist > OR + 5) {
+        // Too far — close in toward target
+        steerToward(drone, angToTarget, dt);
+        drone.speed = lr(drone.speed, DRONE_MAX_SPEED, dt * 3);
+      } else if (dist < OR - 5) {
+        // Too close — back off (steer away)
+        steerToward(drone, angToTarget + Math.PI, dt);
+        drone.speed = lr(drone.speed, DRONE_MAX_SPEED * 0.5, dt * 3);
       } else {
-        aD = true; bD = true; cm = true;
-        var dur = PHASES[triangPhaseIdx].dur + PHASES[trackPhaseIdx].dur;
-        var pt = Math.min(Math.max((tk - PE[triangPhaseIdx - 1]) / dur, 0), 1);
-        var ba = Math.PI * 0.4 + pt * Math.PI * 3.2, w = 1.5 * Math.sin(pt * Math.PI * 6);
-        aP = { x: tg.x + (OR + w) * Math.cos(ba), z: tg.z + (OR + w) * Math.sin(ba) };
-        bP = { x: tg.x + (OR - w) * Math.cos(ba + Math.PI), z: tg.z + (OR - w) * Math.sin(ba + Math.PI) };
+        // At orbit distance — orbit around target, always facing it
+        var orbitDir = angToTarget + Math.PI / 2; // perpendicular = orbit
+        steerToward(drone, orbitDir, dt);
+        // Keep facing target even while orbiting
+        drone.heading = lr(drone.heading, angToTarget, dt * 2);
+        drone.speed = lr(drone.speed, target.speed > 0.5 ? DRONE_MAX_SPEED * 0.6 : 0.5, dt * 3);
       }
-      // Compute headings: face target when tracking, else face forward along path
-      var aH = droneHeading(aP, tg);
-      var bH = droneHeading(bP, tg);
-      if (pi === 1) { // during search, face along path direction
-        var iaH = Math.min(Math.floor(lt * SA.length), SA.length - 1);
-        var ibH = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
-        if (iaH > 0) aH = droneHeading(SA[iaH - 1], SA[iaH]);
-        if (ibH > 0) bH = droneHeading(SB[ibH - 1], SB[ibH]);
+      drone.x += Math.cos(drone.heading) * drone.speed * dt;
+      drone.z += Math.sin(drone.heading) * drone.speed * dt;
+
+      // ALWAYS relay to partner — continuously update target position
+      if (drone.stateTime > RELAY_DELAY) {
+        partner.partnerTarget = { x: tPos.x, z: tPos.z };
+        if (drone.id === "A") sim.commAB = true; else sim.commBA = true;
+        if (partner.state === "SEARCH") { partner.state = "INTERCEPT"; partner.stateTime = 0; }
       }
-      return { aP: aP, bP: bP, aD: aD, bD: bD, cm: cm, commAB: commAB, commBA: commBA, aInRange: inFOV(aP, aH, tg), bInRange: inFOV(bP, bH, tg), aHeading: aH, bHeading: bH, tg: tg, pi: pi, lt: lt };
-    };
-    var statusText = function(st, phase, ts) {
-      if (ts) return { text: "CONTAINED", color: "#0a8a5a", icon: "●" };
-      if (st.aD && st.bD && !st.commAB) return { text: "TRIANGULATING", color: "#c06020", icon: "◉" };
-      if (st.commAB && st.bD) return { text: "B CLOSING IN", color: "#c06020", icon: "◉" };
-      if (st.commAB && !st.bD) return { text: "A LOCKED · RELAY→B", color: "#20d090", icon: "◈" };
-      if (st.aD && !st.commAB) return { text: "A CHASING · B SEARCHING", color: "#c89020", icon: "◐" };
-      if (phase.i >= 1) return { text: "SEARCHING", color: "#1a80c0", icon: "○" };
-      return null;
-    };
-    return { PHASES: PHASES, PE: PE, SA: SA, SB: SB, tAt: tAt, posAt: posAt, gp: gp, statusText: statusText, triangPhaseIdx: triangPhaseIdx };
+
+      // Transition to triangulate when partner is also chasing/triangulating
+      if (partner.state === "CHASE" || partner.state === "TRIANGULATE") {
+        drone.state = "TRIANGULATE"; drone.stateTime = 0;
+      }
+      break;
+    }
+    case "INTERCEPT": {
+      // Navigate toward relayed target position, then toward target directly when close
+      var wp2 = drone.partnerTarget;
+      if (!wp2) { drone.state = "SEARCH"; drone.stateTime = 0; break; }
+      // If close to target, steer at target directly instead of waypoint
+      var steerTarget = dist < SENSE_R * 1.5 ? tPos : wp2;
+      var angToWp2 = Math.atan2(steerTarget.z - drone.z, steerTarget.x - drone.x);
+      steerToward(drone, angToWp2, dt);
+      drone.speed = Math.min(drone.speed + DRONE_ACCEL * dt, DRONE_MAX_SPEED);
+      drone.x += Math.cos(drone.heading) * drone.speed * dt;
+      drone.z += Math.sin(drone.heading) * drone.speed * dt;
+      // Check if we can see the target — fast transition to CHASE
+      if (canSee) { drone.detectTimer += dt; } else { drone.detectTimer = Math.max(0, drone.detectTimer - dt); }
+      if (drone.detectTimer > DETECT_CONFIRM_TIME * 0.3) {
+        drone.state = "CHASE"; drone.stateTime = 0; drone.lostTimer = 0; drone.partnerTarget = null;
+      }
+      // Update waypoint from partner's ongoing reports
+      if ((partner.state === "CHASE" || partner.state === "TRIANGULATE") && partner.targetLastSeen) {
+        drone.partnerTarget = { x: partner.targetLastSeen.x, z: partner.targetLastSeen.z };
+      }
+      // If partner is already triangulating and we can see, jump straight there
+      if (canSee && partner.state === "TRIANGULATE") {
+        drone.state = "TRIANGULATE"; drone.stateTime = 0;
+      }
+      break;
+    }
+    case "TRIANGULATE": {
+      // ORBIT the target at OR distance — continuous circular orbit, always face target
+      var angFromTarget = Math.atan2(drone.z - tPos.z, drone.x - tPos.x);
+      var angToTgt = angFromTarget + Math.PI;
+
+      // Always face the target (for FOV)
+      drone.heading = angToTgt;
+
+      // Radial correction: push toward OR distance — fast approach, gentle hold
+      var radialSpeed = 0;
+      if (dist > OR + 5) radialSpeed = -DRONE_MAX_SPEED * 0.8; // far away — approach fast
+      else if (dist > OR + 2) radialSpeed = -DRONE_MAX_SPEED * 0.3; // close — gentle approach
+      else if (dist < OR - 2) radialSpeed = DRONE_MAX_SPEED * 0.3; // too close — push out
+
+      // Tangential orbit: continuous circular motion (counterclockwise)
+      var orbitSpeed = DRONE_MAX_SPEED * 0.5; // steady orbit speed
+      var tangentAng = angFromTarget + Math.PI / 2; // perpendicular = orbit direction
+
+      // Apply both radial correction and tangential orbit
+      var moveX = Math.cos(tangentAng) * orbitSpeed * dt + Math.cos(angFromTarget) * radialSpeed * dt;
+      var moveZ = Math.sin(tangentAng) * orbitSpeed * dt + Math.sin(angFromTarget) * radialSpeed * dt;
+      drone.x += moveX;
+      drone.z += moveZ;
+      drone.speed = orbitSpeed;
+
+      drone.targetBearing = angToTgt;
+      drone.lostTimer = 0;
+      break;
+    }
+    case "STRIKE": {
+      // Full speed collision course toward target
+      var angToTgt2 = Math.atan2(tPos.z - drone.z, tPos.x - drone.x);
+      drone.heading = angToTgt2;
+      drone.speed = DRONE_MAX_SPEED * 1.5; // overdrive
+      drone.x += Math.cos(drone.heading) * drone.speed * dt;
+      drone.z += Math.sin(drone.heading) * drone.speed * dt;
+      break;
+    }
+    case "BLAST": {
+      // Dead — no movement
+      drone.speed = 0;
+      break;
+    }
+  }
+  drone.x = Math.max(BOUNDS.xMin, Math.min(BOUNDS.xMax, drone.x));
+  drone.z = Math.max(BOUNDS.zMin, Math.min(BOUNDS.zMax, drone.z));
+}
+
+function stepTargetManual(target, keys, dt) {
+  var dx = 0, dz = 0;
+  if (keys.up) dz += 1;
+  if (keys.down) dz -= 1;
+  if (keys.left) dx -= 1;
+  if (keys.right) dx += 1;
+  if (dx !== 0 || dz !== 0) {
+    var desired = Math.atan2(dz, dx);
+    var diff = ((desired - target.heading + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    target.heading += Math.sign(diff) * Math.min(Math.abs(diff), TARGET_TURN_RATE * dt);
+    target.speed = Math.min(target.speed + TARGET_ACCEL * dt, TARGET_MAX_SPEED);
+  } else {
+    target.speed *= 0.97;
+  }
+  if (target.speed < 0.05) target.speed = 0;
+  target.x += Math.cos(target.heading) * target.speed * dt;
+  target.z += Math.sin(target.heading) * target.speed * dt;
+  target.x = Math.max(BOUNDS.xMin + 3, Math.min(BOUNDS.xMax - 3, target.x));
+  target.z = Math.max(BOUNDS.zMin + 3, Math.min(BOUNDS.zMax - 3, target.z));
+}
+
+function stepTargetAutopilot(target, droneA, droneB, elapsed, dt) {
+  // AI target: cruise around, evade when drones get close
+  var dA = d3({ x: target.x, z: target.z }, { x: droneA.x, z: droneA.z });
+  var dB = d3({ x: target.x, z: target.z }, { x: droneB.x, z: droneB.z });
+  var closestDist = Math.min(dA, dB);
+  var closestDrone = dA < dB ? droneA : droneB;
+
+  if (closestDist < 50) {
+    // Evade! Flee away from closest drone
+    var fleeAng = Math.atan2(target.z - closestDrone.z, target.x - closestDrone.x);
+    // Add zigzag to make evasion harder
+    fleeAng += Math.sin(elapsed * 2) * 0.6;
+    var diff = ((fleeAng - target.heading + Math.PI * 3) % (Math.PI * 2)) - Math.PI;
+    target.heading += Math.sign(diff) * Math.min(Math.abs(diff), TARGET_TURN_RATE * 1.2 * dt);
+    target.speed = Math.min(target.speed + TARGET_ACCEL * dt, TARGET_MAX_SPEED * 0.85);
+  } else {
+    // Cruise: gentle S-curve patrol
+    target.heading += Math.sin(elapsed * 0.3) * 0.3 * dt;
+    target.speed = lr(target.speed, 2.0, dt * 2);
   }
 
-  // ── Scenario 2 ──
-  var P1_END = PE[1], P2_END = PE[2], P3_END = PE[3];
-  function aSearchLost(startPos, n) {
-    var p = [];
-    for (var i = 0; i <= n; i++) {
-      var t = i / n;
-      // A searches BACKWARD first (left/down), then sweeps right — looking in wrong places
-      // This ensures FOV cone points away from target (which fled right)
-      p.push({
-        x: startPos.x - 15 * (1 - t) + t * t * 25 + Math.sin(t * Math.PI * 3) * 10,
-        z: startPos.z - 10 * (1 - t) + t * 15 + Math.cos(t * Math.PI * 2.5) * 12
-      });
-    }
-    return p;
+  // Bounce off boundaries
+  var margin = 15;
+  if (target.x < BOUNDS.xMin + margin) target.heading = lr(target.heading, 0, dt * 3);
+  if (target.x > BOUNDS.xMax - margin) target.heading = lr(target.heading, Math.PI, dt * 3);
+  if (target.z < BOUNDS.zMin + margin) target.heading = lr(target.heading, Math.PI / 2, dt * 3);
+  if (target.z > BOUNDS.zMax - margin) target.heading = lr(target.heading, -Math.PI / 2, dt * 3);
+
+  target.x += Math.cos(target.heading) * target.speed * dt;
+  target.z += Math.sin(target.heading) * target.speed * dt;
+  target.x = Math.max(BOUNDS.xMin + 3, Math.min(BOUNDS.xMax - 3, target.x));
+  target.z = Math.max(BOUNDS.zMin + 3, Math.min(BOUNDS.zMax - 3, target.z));
+}
+
+// Debug logger
+var debugLog = [];
+var debugLastSnapshot = 0;
+var debugPrevStateA = "", debugPrevStateB = "";
+
+function debugCapture(sim, reason) {
+  var tP = { x: sim.target.x, z: sim.target.z };
+  var aCanSee = inFOV({ x: sim.droneA.x, z: sim.droneA.z }, sim.droneA.heading, tP);
+  var bCanSee = inFOV({ x: sim.droneB.x, z: sim.droneB.z }, sim.droneB.heading, tP);
+  debugLog.push({
+    t: Math.round(sim.elapsed * 100) / 100,
+    reason: reason,
+    target: { x: +sim.target.x.toFixed(1), z: +sim.target.z.toFixed(1), hdg: +(sim.target.heading * 180 / Math.PI).toFixed(1), spd: +sim.target.speed.toFixed(2) },
+    droneA: {
+      x: +sim.droneA.x.toFixed(1), z: +sim.droneA.z.toFixed(1),
+      hdg: +(sim.droneA.heading * 180 / Math.PI).toFixed(1), spd: +sim.droneA.speed.toFixed(2),
+      state: sim.droneA.state, stateTime: +sim.droneA.stateTime.toFixed(2),
+      canSee: aCanSee, dist: +d3({ x: sim.droneA.x, z: sim.droneA.z }, tP).toFixed(1),
+      detectTimer: +sim.droneA.detectTimer.toFixed(2), lostTimer: +sim.droneA.lostTimer.toFixed(2),
+      partnerTarget: sim.droneA.partnerTarget ? { x: +sim.droneA.partnerTarget.x.toFixed(1), z: +sim.droneA.partnerTarget.z.toFixed(1) } : null,
+      searchIdx: sim.droneA.searchIdx
+    },
+    droneB: {
+      x: +sim.droneB.x.toFixed(1), z: +sim.droneB.z.toFixed(1),
+      hdg: +(sim.droneB.heading * 180 / Math.PI).toFixed(1), spd: +sim.droneB.speed.toFixed(2),
+      state: sim.droneB.state, stateTime: +sim.droneB.stateTime.toFixed(2),
+      canSee: bCanSee, dist: +d3({ x: sim.droneB.x, z: sim.droneB.z }, tP).toFixed(1),
+      detectTimer: +sim.droneB.detectTimer.toFixed(2), lostTimer: +sim.droneB.lostTimer.toFixed(2),
+      partnerTarget: sim.droneB.partnerTarget ? { x: +sim.droneB.partnerTarget.x.toFixed(1), z: +sim.droneB.partnerTarget.z.toFixed(1) } : null,
+      searchIdx: sim.droneB.searchIdx
+    },
+    commAB: sim.commAB, commBA: sim.commBA, contained: sim.contained
+  });
+}
+
+function stepSim(sim, keys, dt) {
+  sim.elapsed += dt;
+
+  // Debug: capture on state transitions
+  if (sim.droneA.state !== debugPrevStateA || sim.droneB.state !== debugPrevStateB) {
+    debugCapture(sim, "STATE_CHANGE: A=" + debugPrevStateA + "→" + sim.droneA.state + " B=" + debugPrevStateB + "→" + sim.droneB.state);
+    debugPrevStateA = sim.droneA.state;
+    debugPrevStateB = sim.droneB.state;
   }
-  var tAt2 = function(tk) {
-    var stop = PE[triangPhaseIdx];
-    if (tk >= stop) return tAt2(stop - 1);
-    if (tk < P1_END) { var t = tk / P1_END; return { x: -22 - t * 20 + Math.sin(t * Math.PI * 1.8) * 4, z: 26 + t * 4 + Math.cos(t * Math.PI) * 3 }; }
-    var lockX = -22 - 20 + Math.sin(Math.PI * 1.8) * 4, lockZ = 26 + 4 + Math.cos(Math.PI) * 3;
-    if (tk < P2_END) { var dt = (tk - P1_END) / (P2_END - P1_END); var ac = dt * dt; return { x: lockX + ac * 65 + Math.sin(dt * Math.PI * 3) * 8 * dt, z: lockZ - ac * 15 + Math.cos(dt * Math.PI * 2.5) * 6 * dt }; }
-    var lX = lockX + 65 + Math.sin(Math.PI * 3) * 8, lZ = lockZ - 15 + Math.cos(Math.PI * 2.5) * 6;
-    if (tk < P3_END) { var dt2 = (tk - P2_END) / (P3_END - P2_END); var sd = 1 - dt2 * 0.6; return { x: lX + dt2 * 25 * sd + Math.sin(dt2 * Math.PI * 4) * 10, z: lZ + dt2 * 12 * sd + Math.cos(dt2 * Math.PI * 3) * 8 }; }
-    var sf = 0.4, bDX = lX + 25 * sf + Math.sin(Math.PI * 4) * 10, bDZ = lZ + 12 * sf + Math.cos(Math.PI * 3) * 8;
-    var dt3 = (tk - P3_END) / (stop - P3_END); var tired = 1 - dt3 * dt3 * 0.7;
-    return { x: bDX + dt3 * 15 * tired + Math.sin(dt3 * Math.PI * 3) * 6 * tired, z: bDZ - dt3 * 10 * tired + Math.cos(dt3 * Math.PI * 2) * 5 * tired };
-  };
-  var posAt2 = function(tk) {
-    var r = gp(tk), pi = r.i, lt = r.t;
-    var tg = tAt2(tk);
-    var aP = SA[0], bP = SB[0], aD = false, bD = false, cm = false, commAB = false, commBA = false;
-    if (pi === 0) {
-      aP = { x: lr(-3, SA[0].x, lt), z: lr(-30, SA[0].z, lt) };
-      bP = { x: lr(3, SB[0].x, lt), z: lr(-30, SB[0].z, lt) };
-    } else if (pi === 1) {
-      var ia = Math.min(Math.floor(lt * SA.length), SA.length - 1);
-      var ib = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
-      aP = SA[ia]; bP = SB[ib];
-    } else if (pi === 2) {
-      aD = true; cm = true;
-      var tgP = tAt2(Math.max(0, tk - 4));
-      var fa = Math.atan2(tg.z - tgP.z, tg.x - tgP.x);
-      var ca = fa + Math.PI + lt * 0.5 - 0.2, cd = SENSE_R * 0.7 - lt * 4;
-      aP = { x: tg.x + cd * Math.cos(ca), z: tg.z + cd * Math.sin(ca) };
-      if (lt < 0.5) { var bi = bSearchEnd + Math.min(Math.floor(lt / 0.5 * (bTotalPts - bSearchEnd)), bTotalPts - bSearchEnd); bP = SB[bi]; }
-      else { commAB = true; var bs = SB[bTotalPts], rt = (lt - 0.5) / 0.5, re = rt * rt * rt; bP = { x: lr(bs.x, bs.x + (tg.x - bs.x) * 0.15, re), z: lr(bs.z, bs.z + (tg.z - bs.z) * 0.15, re) }; }
-    } else if (pi === 3) {
-      var aLS = tAt2(P2_END - 1); var aCE = { x: aLS.x + 5, z: aLS.z };
-      var aSP = aSearchLost(aCE, 60); var asi = Math.min(Math.floor(lt * aSP.length), aSP.length - 1);
-      aP = aSP[asi];
-      var bSP = SB[bTotalPts]; var bGA = tAt2(P2_END);
-      var bE = lt < 0.4 ? lt * lt * lt / (0.4 * 0.4 * 0.4) * 0.3 : 0.3 + 0.7 * eIO((lt - 0.4) / 0.6);
-      bP = { x: lr(bSP.x, bGA.x + 15 + Math.sin(lt * Math.PI * 2) * 10, bE), z: lr(bSP.z, bGA.z + 5 + Math.cos(lt * Math.PI * 1.5) * 8, bE) };
-      cm = true;
-    } else if (pi === 4) {
-      bD = true; cm = true; commBA = true;
-      var tgP3 = tAt2(Math.max(0, tk - 4));
-      var fa3 = Math.atan2(tg.z - tgP3.z, tg.x - tgP3.x);
-      var ca3 = fa3 + Math.PI - lt * 0.5 + 0.2, cd3 = SENSE_R * 0.65 - lt * 3;
-      bP = { x: tg.x + cd3 * Math.cos(ca3), z: tg.z + cd3 * Math.sin(ca3) };
-      var aLE = tAt2(P2_END - 1); var aFP = { x: aLE.x + 35, z: aLE.z + 10 };
-      var rT = Math.max(0, (lt - 0.15) / 0.85);
-      var aE = rT < 0.5 ? rT * rT * rT / (0.5 * 0.5 * 0.5) * 0.35 : 0.35 + 0.65 * eIO((rT - 0.5) / 0.5);
-      var aGA = ca3 + Math.PI;
-      var aG = { x: tg.x + OR * Math.cos(aGA), z: tg.z + OR * Math.sin(aGA) };
-      aP = { x: lr(aFP.x, aG.x, aE), z: lr(aFP.z, aG.z, aE) };
-      if (lt > 0.6) aD = true;
+  // Debug: periodic snapshot every 0.5s
+  if (sim.elapsed - debugLastSnapshot > 0.5) {
+    debugCapture(sim, "PERIODIC");
+    debugLastSnapshot = sim.elapsed;
+  }
+  // Triangulation → contained → strike → blast
+  if (sim.droneA.state === "TRIANGULATE" && sim.droneB.state === "TRIANGULATE" && !sim.contained) {
+    sim.contained = true;
+    sim.containedTime = 0;
+  }
+  if (sim.contained && !sim.blasted) {
+    // Only count orbiting time when BOTH drones are near orbit distance
+    var aOrbitDist = d3({ x: sim.droneA.x, z: sim.droneA.z }, { x: sim.target.x, z: sim.target.z });
+    var bOrbitDist = d3({ x: sim.droneB.x, z: sim.droneB.z }, { x: sim.target.x, z: sim.target.z });
+    var bothInOrbit = aOrbitDist < OR + 8 && bOrbitDist < OR + 8;
+    if (bothInOrbit) {
+      sim.containedTime = (sim.containedTime || 0) + dt;
+    }
+    // After 6 seconds of BOTH orbiting → STRIKE
+    if (sim.containedTime > 6 && sim.droneA.state !== "STRIKE" && sim.droneA.state !== "BLAST") {
+      sim.droneA.state = "STRIKE"; sim.droneA.stateTime = 0;
+      sim.droneB.state = "STRIKE"; sim.droneB.stateTime = 0;
+    }
+  }
+  // Check blast — both drones reach target
+  var aDist = d3({ x: sim.droneA.x, z: sim.droneA.z }, { x: sim.target.x, z: sim.target.z });
+  var bDist = d3({ x: sim.droneB.x, z: sim.droneB.z }, { x: sim.target.x, z: sim.target.z });
+  if (sim.droneA.state === "STRIKE" && sim.droneB.state === "STRIKE" && aDist < 4 && bDist < 4 && !sim.blasted) {
+    sim.blasted = true;
+    sim.blastTime = sim.elapsed;
+    sim.droneA.state = "BLAST"; sim.droneB.state = "BLAST";
+  }
+
+  // Freeze target when contained, otherwise step based on mode
+  if (!sim.contained) {
+    if (sim.mode === "autopilot") {
+      stepTargetAutopilot(sim.target, sim.droneA, sim.droneB, sim.elapsed, dt);
     } else {
-      aD = true; bD = true; cm = true;
-      var dur = PHASES[triangPhaseIdx].dur + PHASES[trackPhaseIdx].dur;
-      var pt = Math.min(Math.max((tk - PE[triangPhaseIdx - 1]) / dur, 0), 1);
-      var ba = Math.PI * 0.4 + pt * Math.PI * 3.2, w = 1.5 * Math.sin(pt * Math.PI * 6);
-      aP = { x: tg.x + (OR + w) * Math.cos(ba), z: tg.z + (OR + w) * Math.sin(ba) };
-      bP = { x: tg.x + (OR - w) * Math.cos(ba + Math.PI), z: tg.z + (OR - w) * Math.sin(ba + Math.PI) };
+      stepTargetManual(sim.target, keys, dt);
     }
-    var aH = droneHeading(aP, tg);
-    var bH = droneHeading(bP, tg);
-    if (pi === 1) {
-      // Search: face along path direction
-      var iaH2 = Math.min(Math.floor(lt * SA.length), SA.length - 1);
-      var ibH2 = Math.min(Math.floor(lt * bSearchEnd), bSearchEnd - 1);
-      if (iaH2 > 0) aH = droneHeading(SA[iaH2 - 1], SA[iaH2]);
-      if (ibH2 > 0) bH = droneHeading(SB[ibH2 - 1], SB[ibH2]);
-    } else if (pi === 3) {
-      // A_LOST: A searches in wrong directions (doesn't know where target is)
-      // A faces along its search path, sweeping away from target
-      var aSPH = aSearchLost({ x: tAt2(P2_END - 1).x + 5, z: tAt2(P2_END - 1).z }, 60);
-      var asiH = Math.min(Math.floor(lt * aSPH.length), aSPH.length - 1);
-      if (asiH > 0) aH = droneHeading(aSPH[asiH - 1], aSPH[asiH]);
-      // B faces along its approach direction toward last known area
-      var bSPH = SB[bTotalPts];
-      var bGoalH = tAt2(P2_END);
-      bH = droneHeading(bP, { x: bGoalH.x + 15, z: bGoalH.z + 5 });
-    } else if (pi === 4 && lt < 0.6) {
-      // B_LOCK early: A is still navigating, faces toward B's position (relay direction)
-      aH = droneHeading(aP, bP);
-    }
-    return { aP: aP, bP: bP, aD: aD, bD: bD, cm: cm, commAB: commAB, commBA: commBA, aInRange: inFOV(aP, aH, tg), bInRange: inFOV(bP, bH, tg), aHeading: aH, bHeading: bH, tg: tg, pi: pi, lt: lt };
-  };
-  var statusText2 = function(st, phase, ts) {
-    if (ts) return { text: "CONTAINED", color: "#0a8a5a", icon: "●" };
-    if (st.pi >= triangPhaseIdx) return { text: "TRIANGULATING", color: "#c06020", icon: "◉" };
-    if (st.commBA) return { text: "B LOCKED · RELAY→A", color: "#6050e0", icon: "◈" };
-    if (st.pi === 3) return { text: "A LOST TARGET · SEARCHING", color: "#c03030", icon: "✕" };
-    if (st.commAB && !st.bD) return { text: "A LOCKED · RELAY→B", color: "#20d090", icon: "◈" };
-    if (st.aD && !st.commAB) return { text: "A CHASING · B SEARCHING", color: "#c89020", icon: "◐" };
-    if (phase.i >= 1) return { text: "SEARCHING", color: "#1a80c0", icon: "○" };
-    return null;
-  };
-  return { PHASES: PHASES, PE: PE, SA: SA, SB: SB, tAt: tAt2, posAt: posAt2, gp: gp, statusText: statusText2, triangPhaseIdx: triangPhaseIdx };
+  } else {
+    sim.target.speed *= 0.95;
+    if (sim.target.speed < 0.05) sim.target.speed = 0;
+    sim.target.x += Math.cos(sim.target.heading) * sim.target.speed * dt;
+    sim.target.z += Math.sin(sim.target.heading) * sim.target.speed * dt;
+  }
+  stepDrone(sim.droneA, sim.target, sim.droneB, sim, dt);
+  stepDrone(sim.droneB, sim.target, sim.droneA, sim, dt);
+
+  // Post-step: FORCE triangulation if both drones can see the target — no exceptions
+  var tP = { x: sim.target.x, z: sim.target.z };
+  var aCanSee = inFOV({ x: sim.droneA.x, z: sim.droneA.z }, sim.droneA.heading, tP);
+  var bCanSee = inFOV({ x: sim.droneB.x, z: sim.droneB.z }, sim.droneB.heading, tP);
+  if (aCanSee && bCanSee) {
+    // Both have visual — triangulate immediately regardless of current state
+    if (sim.droneA.state !== "TRIANGULATE") { sim.droneA.state = "TRIANGULATE"; sim.droneA.stateTime = 0; sim.droneA.lostTimer = 0; }
+    if (sim.droneB.state !== "TRIANGULATE") { sim.droneB.state = "TRIANGULATE"; sim.droneB.stateTime = 0; sim.droneB.lostTimer = 0; }
+    sim.commAB = true; sim.commBA = true;
+  }
+
+  // Also: if one drone is chasing and close to target, and the other can see → triangulate
+  var aDist = d3({ x: sim.droneA.x, z: sim.droneA.z }, tP);
+  var bDist = d3({ x: sim.droneB.x, z: sim.droneB.z }, tP);
+  if (aCanSee && bDist < SENSE_R && sim.droneB.state !== "SEARCH") {
+    sim.droneA.state = "TRIANGULATE"; sim.droneA.stateTime = 0;
+    sim.droneB.state = "TRIANGULATE"; sim.droneB.stateTime = 0;
+    sim.commAB = true; sim.commBA = true;
+  }
+  if (bCanSee && aDist < SENSE_R && sim.droneA.state !== "SEARCH") {
+    sim.droneA.state = "TRIANGULATE"; sim.droneA.stateTime = 0;
+    sim.droneB.state = "TRIANGULATE"; sim.droneB.stateTime = 0;
+    sim.commAB = true; sim.commBA = true;
+  }
+
+  if (sim.droneA.state === "SEARCH" && sim.droneB.state === "SEARCH") { sim.commAB = false; sim.commBA = false; }
+  // Accumulate trails
+  sim.trailTimer += dt;
+  if (sim.trailTimer > TRAIL_INTERVAL) {
+    sim.trailTimer = 0;
+    if (sim.aTrail.length < TRAIL_MAX) sim.aTrail.push({ x: sim.droneA.x, z: sim.droneA.z });
+    if (sim.bTrail.length < TRAIL_MAX) sim.bTrail.push({ x: sim.droneB.x, z: sim.droneB.z });
+    if (sim.tTrail.length < TRAIL_MAX) sim.tTrail.push({ x: sim.target.x, z: sim.target.z });
+  }
 }
 
-// Pre-build scenarios
-var scenarioCache = {};
-function getScenario(id) {
-  if (!scenarioCache[id]) scenarioCache[id] = buildScenario(SCENARIOS[id]);
-  return scenarioCache[id];
+function simSnapshot(sim) {
+  var aP = { x: sim.droneA.x, z: sim.droneA.z };
+  var bP = { x: sim.droneB.x, z: sim.droneB.z };
+  var tg = { x: sim.target.x, z: sim.target.z };
+  var aH = sim.droneA.heading, bH = sim.droneB.heading;
+  var aInR = inFOV(aP, aH, tg), bInR = inFOV(bP, bH, tg);
+  var aD = sim.droneA.state !== "SEARCH";
+  var bD = sim.droneB.state !== "SEARCH";
+  var cm = sim.commAB || sim.commBA;
+  var pi = 1;
+  if (sim.blasted) pi = 8;
+  else if (sim.droneA.state === "STRIKE") pi = 7;
+  else if (sim.contained) pi = 6;
+  else if (sim.droneA.state === "TRIANGULATE" && sim.droneB.state === "TRIANGULATE") pi = 5;
+  else if (aD && bD) pi = 4;
+  else if (cm) pi = 3;
+  else if (aD || bD) pi = 2;
+  return { aP: aP, bP: bP, tg: tg, aD: aD, bD: bD, cm: cm, commAB: sim.commAB, commBA: sim.commBA, aInRange: aInR, bInRange: bInR, aHeading: aH, bHeading: bH, pi: pi, lt: 0 };
 }
 
-// 2D Map - pure SVG, no state, just reads tick
-function Map2D({ tick, scenario, proto }) {
-  var s = scenario.posAt(tick);
-  var ts = tick >= scenario.PE[scenario.triangPhaseIdx];
+function simStatusText(sim) {
+  var a = sim.droneA.state, b = sim.droneB.state;
+  if (sim.blasted) return { text: "TARGET DESTROYED", color: "#c03030", icon: "💥" };
+  if (a === "STRIKE") return { text: "STRIKE INBOUND", color: "#c03030", icon: "⚡" };
+  var orbTime = sim.containedTime || 0;
+  if (sim.contained) return { text: orbTime > 0 ? "ORBITING — STRIKE IN " + Math.max(0, 6 - orbTime).toFixed(0) + "s" : "CONTAINED — WAITING FOR ORBIT", color: "#c06020", icon: "●" };
+  if (a === "TRIANGULATE" && b === "TRIANGULATE") return { text: "TRIANGULATING", color: "#0a6a5a", icon: "◉" };
+  if (a === "CHASE" && b === "CHASE") return { text: "DUAL CHASE", color: "#c06020", icon: "◉" };
+  if (sim.commBA) return { text: "B→A RELAY · A INTERCEPTING", color: "#6050e0", icon: "◈" };
+  if (sim.commAB) return { text: "A→B RELAY · B INTERCEPTING", color: "#20d090", icon: "◈" };
+  if (a === "CHASE") return { text: "A CHASING · B " + b, color: "#c89020", icon: "◐" };
+  if (b === "CHASE") return { text: "B CHASING · A " + a, color: "#c89020", icon: "◐" };
+  if (a === "INTERCEPT" || b === "INTERCEPT") return { text: "INTERCEPTING", color: "#c06020", icon: "◎" };
+  return { text: "SEARCHING", color: "#1a80c0", icon: "○" };
+}
+
+// Dummy for compat — not used in v6 but some components reference it
+var SCENARIOS = {}; // empty, no scripted scenarios in v6
+function Map2D({ state, trail, proto, elapsed, blasted }) {
+  var s = state;
+  var ts = s.pi >= 5;
   var SC = 4.5;
   var W = 600, H = 600;
   var cx = function(x) { return W / 2 + x * SC; };
   var cy = function(z) { return H * 0.45 - z * SC; };
 
-  // Build trails directly - sample every 12 ticks for performance
-  var aTrail = [], bTrail = [], tTrail = [];
-  for (var t = 0; t <= tick; t += 12) {
-    var st = scenario.posAt(t);
-    aTrail.push(st.aP);
-    bTrail.push(st.bP);
-    if (st.pi >= 2) tTrail.push(st.tg);
-  }
+  var aTrail = trail.a, bTrail = trail.b, tTrail = trail.t;
 
   var pD = function(arr) {
     if (arr.length < 2) return "";
@@ -379,6 +503,10 @@ function Map2D({ tick, scenario, proto }) {
     <svg viewBox={"0 0 " + W + " " + H} style={{ display: "block", background: "#f4f8fb", borderRadius: 6, border: "1px solid #e0e8f0", width: "100%", flex: 1 }} preserveAspectRatio="xMidYMid meet">
       {Array.from({ length: 21 }, function(_, i) { return <line key={"v" + i} x1={i * 30} y1="0" x2={i * 30} y2={H} stroke="#e8eff5" strokeWidth=".5" />; })}
       {Array.from({ length: 21 }, function(_, i) { return <line key={"h" + i} x1="0" y1={i * 30} x2={W} y2={i * 30} stroke="#e8eff5" strokeWidth=".5" />; })}
+
+      {/* Playground boundary */}
+      <rect x={cx(BOUNDS.xMin)} y={cy(BOUNDS.zMax)} width={(BOUNDS.xMax - BOUNDS.xMin) * SC} height={(BOUNDS.zMax - BOUNDS.zMin) * SC} fill="none" stroke="#c03030" strokeWidth="1.5" strokeDasharray="8 4" opacity=".3" rx="4" />
+      <text x={cx(BOUNDS.xMax) - 4} y={cy(BOUNDS.zMax) + 12} textAnchor="end" style={{ fontSize: "8px", fill: "#c03030", fontFamily: "monospace", opacity: 0.5 }}>BOUNDARY</text>
 
       {aTrail.length > 1 && <path d={pD(aTrail)} fill="none" stroke="#0a8a5a" strokeWidth="2" opacity=".25" />}
       {bTrail.length > 1 && <path d={pD(bTrail)} fill="none" stroke="#4838d0" strokeWidth="2" opacity=".25" />}
@@ -458,7 +586,7 @@ function Map2D({ tick, scenario, proto }) {
           return <g>
             <line x1={cx(txP.x)} y1={cy(txP.z)} x2={cx(rxP.x)} y2={cy(rxP.z)} stroke="#20d090" strokeWidth="2" opacity=".35" />
             {[0, .25, .5, .75].map(function(off, ci) {
-              var ct = ((tick * .012 + off) % 1);
+              var ct = ((elapsed * 1.5 + off) % 1);
               return <circle key={"d2d" + ci} cx={lr(cx(txP.x), cx(rxP.x), ct)} cy={lr(cy(txP.z), cy(rxP.z), ct)} r={3 + 2 * Math.sin(ct * Math.PI)} fill="#20d090" opacity={.8 * Math.sin(ct * Math.PI)} />;
             })}
             <text x={(cx(txP.x) + cx(rxP.x)) / 2} y={(cy(txP.z) + cy(rxP.z)) / 2 - 10} textAnchor="middle" style={{ fontSize: "9px", fill: "#20d090", fontFamily: "monospace", fontWeight: 700 }}>D2D {txLabel}→{rxLabel}</text>
@@ -468,13 +596,13 @@ function Map2D({ tick, scenario, proto }) {
             {/* TX → GS */}
             <line x1={cx(txP.x)} y1={cy(txP.z)} x2={cx(GS_POS.x)} y2={cy(GS_POS.z)} stroke="#f0a030" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />
             {[0, .33, .66].map(function(off, ci) {
-              var ct = ((tick * .006 + off) % 1);
+              var ct = ((elapsed * 0.8 + off) % 1);
               return <circle key={"d2g1" + ci} cx={lr(cx(txP.x), cx(GS_POS.x), ct)} cy={lr(cy(txP.z), cy(GS_POS.z), ct)} r={2.5 + 1.5 * Math.sin(ct * Math.PI)} fill="#f0a030" opacity={.7 * Math.sin(ct * Math.PI)} />;
             })}
             {/* GS → RX */}
             <line x1={cx(GS_POS.x)} y1={cy(GS_POS.z)} x2={cx(rxP.x)} y2={cy(rxP.z)} stroke="#f0a030" strokeWidth="1.5" opacity=".3" strokeDasharray="5 4" />
             {[0, .33, .66].map(function(off, ci) {
-              var ct = ((tick * .006 + off + .15) % 1);
+              var ct = ((elapsed * 0.8 + off + .15) % 1);
               return <circle key={"d2g2" + ci} cx={lr(cx(GS_POS.x), cx(rxP.x), ct)} cy={lr(cy(GS_POS.z), cy(rxP.z), ct)} r={2.5 + 1.5 * Math.sin(ct * Math.PI)} fill="#f0a030" opacity={.7 * Math.sin(ct * Math.PI)} />;
             })}
             <text x={cx(GS_POS.x)} y={cy(GS_POS.z) - 16} textAnchor="middle" style={{ fontSize: "9px", fill: "#f0a030", fontFamily: "monospace", fontWeight: 700 }}>RELAY {txLabel}→GS→{rxLabel}</text>
@@ -491,11 +619,29 @@ function Map2D({ tick, scenario, proto }) {
       {s.bD && <line x1={cx(s.bP.x)} y1={cy(s.bP.z)} x2={cx(s.tg.x)} y2={cy(s.tg.z)} stroke="#c06020" strokeWidth="1.4" opacity=".4" strokeDasharray="6 5" />}
 
       {/* Target */}
-      <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="9" fill="#d03030" stroke="#fff" strokeWidth="2" />
-      <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="3.5" fill="#f8a0a0" />
-      <text x={cx(s.tg.x) + 14} y={cy(s.tg.z) + 5} style={{ fontSize: "13px", fill: ts ? "#0a8a5a" : s.pi === 3 ? "#c03030" : "#b02020", fontFamily: "monospace", fontWeight: 700 }}>
-        {ts ? "IDLE" : s.pi === 3 ? "ESCAPED" : s.pi >= 2 ? "EVADING" : ""}
-      </text>
+      {!blasted && <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="9" fill="#d03030" stroke="#fff" strokeWidth="2" />}
+      {!blasted && <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="3.5" fill="#f8a0a0" />}
+      {!blasted && <text x={cx(s.tg.x) + 14} y={cy(s.tg.z) + 5} style={{ fontSize: "13px", fill: ts ? "#0a8a5a" : s.pi === 3 ? "#c03030" : "#b02020", fontFamily: "monospace", fontWeight: 700 }}>
+        {s.pi >= 7 ? "STRIKE" : ts ? "IDLE" : s.pi >= 2 ? "EVADING" : ""}
+      </text>}
+      {/* Blast effect on 2D map */}
+      {blasted && <g>
+        <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="30" fill="#ff4400" fillOpacity="0.4">
+          <animate attributeName="r" from="5" to="60" dur="2s" fill="freeze" />
+          <animate attributeName="fill-opacity" from="0.8" to="0" dur="2s" fill="freeze" />
+        </circle>
+        <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="15" fill="#ffff00" fillOpacity="0.6">
+          <animate attributeName="r" from="3" to="35" dur="1.5s" fill="freeze" />
+          <animate attributeName="fill-opacity" from="1" to="0" dur="1.5s" fill="freeze" />
+        </circle>
+        <circle cx={cx(s.tg.x)} cy={cy(s.tg.z)} r="50" fill="none" stroke="#ff2200" strokeWidth="3" opacity="0.5">
+          <animate attributeName="r" from="10" to="80" dur="2.5s" fill="freeze" />
+          <animate attributeName="opacity" from="0.8" to="0" dur="2.5s" fill="freeze" />
+        </circle>
+        <text x={cx(s.tg.x)} y={cy(s.tg.z) - 5} textAnchor="middle" style={{ fontSize: "18px", fill: "#ff4400", fontFamily: "monospace", fontWeight: 900 }}>
+          DESTROYED
+        </text>
+      </g>}
 
       {/* Drone A */}
       <polygon points={cx(s.aP.x) + "," + (cy(s.aP.z) - 9) + " " + (cx(s.aP.x) - 8) + "," + (cy(s.aP.z) + 7) + " " + (cx(s.aP.x) + 8) + "," + (cy(s.aP.z) + 7)} fill="#0a8a5a" stroke="#fff" strokeWidth="1.2" />
@@ -523,25 +669,17 @@ function Map2D({ tick, scenario, proto }) {
 // ════════════════════════════════════════════════════
 // IMU TELEMETRY PANEL
 // ════════════════════════════════════════════════════
-var TICK_DT = 65 / TOTAL;
+// V6: speeds are directly available from sim, no TICK_DT needed
 
 function IMUPanel({ label, color, pos, heading, speed, roll, pitch, bearing, dist, inRange }) {
   var hdg = ((heading * 180 / Math.PI) + 360) % 360;
   var brg = ((bearing * 180 / Math.PI) + 360) % 360;
-  var rl = (roll * 180 / Math.PI).toFixed(1);
-  var pt = (pitch * 180 / Math.PI).toFixed(1);
-  var gs = { display: "grid", gridTemplateColumns: "50px 1fr", gap: "1px 6px", lineHeight: "14px" };
   return (
-    <div style={{ width: 200, background: "#0a1520e8", color: "#8ab0c8", padding: "5px 7px", borderRadius: "0 0 4px 4px", border: "1px solid " + color + "30", borderTop: "none", fontSize: 9, fontFamily: "monospace" }}>
-      <div style={gs}>
-        <span>HDG</span><span style={{ color: "#e0f0ff" }}>{hdg.toFixed(1)}°</span>
-        <span>SPD</span><span style={{ color: "#e0f0ff" }}>{speed.toFixed(1)} m/s</span>
-        <span>POS</span><span style={{ color: "#e0f0ff" }}>{pos.x.toFixed(1)}, {pos.z.toFixed(1)}</span>
-        <span>ROLL</span><span style={{ color: "#e0f0ff" }}>{rl}°</span>
-        <span>PITCH</span><span style={{ color: "#e0f0ff" }}>{pt}°</span>
-        <span>BRG</span><span style={{ color: inRange ? "#ffd700" : "#e0f0ff" }}>{brg.toFixed(1)}°</span>
-        <span>DIST</span><span style={{ color: inRange ? "#ffd700" : "#e0f0ff" }}>{dist.toFixed(1)}m</span>
-      </div>
+    <div style={{ background: "#0a1520e8", color: "#8ab0c8", padding: "3px 6px", borderRadius: "0 0 4px 4px", border: "1px solid " + color + "25", borderTop: "none", fontSize: 8, fontFamily: "monospace", display: "flex", gap: 8, flexWrap: "wrap", lineHeight: "13px" }}>
+      <span>HDG <span style={{ color: "#e0f0ff" }}>{hdg.toFixed(0)}°</span></span>
+      <span>SPD <span style={{ color: "#e0f0ff" }}>{speed.toFixed(1)}</span></span>
+      <span>BRG <span style={{ color: inRange ? "#ffd700" : "#e0f0ff" }}>{brg.toFixed(0)}°</span></span>
+      <span>DST <span style={{ color: inRange ? "#ffd700" : "#e0f0ff" }}>{dist.toFixed(0)}m</span></span>
     </div>
   );
 }
@@ -572,70 +710,44 @@ function FPVOverlay({ heading, inRange, dist, color }) {
 // ════════════════════════════════════════════════════
 // INSTRUCTION SHARING LOG
 // ════════════════════════════════════════════════════
-function getInstructions(scenarioId, sc, tick, proto) {
-  var st = sc.posAt(tick);
-  var pi = st.pi, lt = st.lt;
+function getInstructions(sim, st, proto) {
   var msgs = [];
   var brg = function(from, to) { return (((Math.atan2(to.z - from.z, to.x - from.x) * 180 / Math.PI) + 360) % 360).toFixed(0); };
   var dst = function(a, b) { return d3(a, b).toFixed(0); };
-  var pc = PROTOCOLS[proto].color;
   var tag = "[" + proto + "] ";
-
-  // Helper: route a message from drone X to drone Y through the selected protocol
   function relay(from, to, text) {
-    if (proto === "D2D") {
-      msgs.push({ from: from, to: to, c: "#20d090", text: tag + text });
-    } else {
-      msgs.push({ from: from, to: "GS", c: "#f0a030", text: tag + text });
-      msgs.push({ from: "GS", to: to, c: "#f0a030", text: "RELAY: " + text });
-    }
+    if (proto === "D2D") { msgs.push({ from: from, to: to, c: "#20d090", text: tag + text }); }
+    else { msgs.push({ from: from, to: "GS", c: "#f0a030", text: tag + text }); msgs.push({ from: "GS", to: to, c: "#f0a030", text: "RELAY: " + text }); }
   }
-
-  if (pi === 0) {
-    msgs.push({ from: "GS", to: "A,B", c: "#f0a030", text: "DEPLOY to search grid. A: sector NW, B: sector NE" });
-  } else if (pi === 1) {
-    msgs.push({ from: "A", to: "GS", c: "#0a8a5a", text: tag + "Search pattern active. No contact." });
-    msgs.push({ from: "B", to: "GS", c: "#4838d0", text: tag + "Search pattern active. No contact." });
-  } else if (scenarioId === "s1") {
-    if (pi === 2 && !st.commAB) {
-      msgs.push({ from: "A", to: "GS", c: "#c89020", text: tag + "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m. Pursuing." });
-    } else if (pi === 2 && st.commAB) {
-      relay("A", "B", "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.aP, st.tg) + "°. Intercept!");
-      relay("B", "A", "ACK. Proceeding to intercept zone.");
-    } else if (pi === 3) {
-      relay("A", "B", "Updated pos (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Close from opposite BRG.");
-      if (lt > 0.65) relay("B", "A", "Visual contact. Dual lock confirmed.");
-    } else if (pi >= 4) {
-      relay("A", "B", "TRIANGULATE. Maintain 180° sep. Orbit R:" + OR + "m.");
-      relay("B", "A", "Copy. Target contained.");
-    }
-  } else {
-    if (pi === 2 && !st.commAB) {
-      msgs.push({ from: "A", to: "GS", c: "#c89020", text: tag + "CONTACT. BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m." });
-    } else if (pi === 2 && st.commAB) {
-      relay("A", "B", "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). Navigate to area.");
-      relay("B", "A", "ACK. En route.");
-    } else if (pi === 3) {
-      msgs.push({ from: "A", to: "GS", c: "#c03030", text: tag + "LOST CONTACT. Last known (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + ")." });
-      msgs.push({ from: "GS", to: "B", c: "#f0a030", text: "A lost contact. Proceed to last known area." });
-    } else if (pi === 4) {
-      relay("B", "A", "CONTACT re-acquired (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.bP, st.tg) + "°.");
-      if (lt > 0.5) relay("A", "B", "ACK. Visual acquired.");
-    } else if (pi >= 5) {
-      relay("A", "B", "TRIANGULATE. 180° sep. Orbit R:" + OR + "m.");
-      relay("B", "A", "Copy. Contained.");
-    }
+  var a = sim.droneA.state, b = sim.droneB.state;
+  if (a === "SEARCH" && b === "SEARCH") {
+    msgs.push({ from: "A", to: "GS", c: "#0a8a5a", text: tag + "Searching. No contact." });
+    msgs.push({ from: "B", to: "GS", c: "#4838d0", text: tag + "Searching. No contact." });
+  } else if (a === "CHASE" && !st.commAB && !st.commBA) {
+    msgs.push({ from: "A", to: "GS", c: "#c89020", text: tag + "CONTACT BRG " + brg(st.aP, st.tg) + "° R:" + dst(st.aP, st.tg) + "m." });
+  } else if (b === "CHASE" && !st.commAB && !st.commBA) {
+    msgs.push({ from: "B", to: "GS", c: "#c89020", text: tag + "CONTACT BRG " + brg(st.bP, st.tg) + "° R:" + dst(st.bP, st.tg) + "m." });
+  } else if (st.commAB) {
+    relay("A", "B", "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.aP, st.tg) + "°. Intercept!");
+    if (b === "INTERCEPT") msgs.push({ from: "B", to: "GS", c: "#4838d0", text: tag + "ACK. En route to intercept." });
+  } else if (st.commBA) {
+    relay("B", "A", "TARGET at (" + st.tg.x.toFixed(0) + "," + st.tg.z.toFixed(0) + "). BRG " + brg(st.bP, st.tg) + "°. Intercept!");
+    if (a === "INTERCEPT") msgs.push({ from: "A", to: "GS", c: "#0a8a5a", text: tag + "ACK. En route to intercept." });
+  }
+  if (a === "TRIANGULATE" && b === "TRIANGULATE") {
+    relay("A", "B", "TRIANGULATE. 180° sep. Orbit R:" + OR + "m.");
+    relay("B", "A", "Copy. Target contained.");
   }
   return msgs;
 }
 
 function InstructionLog({ messages }) {
   return (
-    <div style={{ width: 310, background: "#0a1520e0", borderRadius: 6, padding: "6px 8px", border: "1px solid #20d09030", fontSize: 9, fontFamily: "monospace" }}>
-      <div style={{ fontWeight: 700, color: "#20d090", marginBottom: 3, fontSize: 8, letterSpacing: 1 }}>INTER-DRONE COMM</div>
-      {messages.map(function(m, i) {
-        return <div key={i} style={{ padding: "2px 0", borderBottom: "1px solid #ffffff08", color: m.c || "#8ab0c8" }}>
-          <span style={{ fontWeight: 700, color: "#e0f0ff" }}>[{m.from}→{m.to}]</span> {m.text}
+    <div style={{ background: "#0a1520e8", borderRadius: 5, padding: "4px 6px", border: "1px solid #20d09020", fontSize: 8, fontFamily: "monospace", lineHeight: "12px" }}>
+      <div style={{ fontWeight: 700, color: "#20d090", marginBottom: 2, fontSize: 7, letterSpacing: 0.5 }}>COMM LOG</div>
+      {messages.slice(0, 4).map(function(m, i) {
+        return <div key={i} style={{ padding: "1px 0", color: m.c || "#8ab0c8", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+          <span style={{ fontWeight: 700, color: "#b0c8d8" }}>[{m.from}→{m.to}]</span> {m.text}
         </div>;
       })}
     </div>
@@ -657,21 +769,19 @@ function PathOptPanel({ st, triangPhaseIdx }) {
   var quality = gdop < 1.2 ? "OPTIMAL" : gdop < 2 ? "GOOD" : "CONVERGING";
   var qCol = gdop < 1.2 ? "#0a8a5a" : gdop < 2 ? "#c89020" : "#c06020";
   return (
-    <div style={{ background: "#0a1520e0", borderRadius: 6, padding: "6px 8px", border: "1px solid #c0602030", fontSize: 9, fontFamily: "monospace", color: "#8ab0c8" }}>
-      <div style={{ fontWeight: 700, color: "#c06020", marginBottom: 3, fontSize: 8, letterSpacing: 1 }}>TRIANGULATION OPT</div>
-      <div style={{ display: "grid", gridTemplateColumns: "65px 1fr", gap: "1px 6px", lineHeight: "14px" }}>
-        <span>ANG SEP</span><span style={{ color: "#e0f0ff" }}>{sepDeg.toFixed(1)}° / 180°</span>
-        <span>GDOP</span><span style={{ color: qCol, fontWeight: 700 }}>{gdop.toFixed(2)} {quality}</span>
-        <span>ORBIT A</span><span style={{ color: "#e0f0ff" }}>{rA.toFixed(1)}m / {OR}m</span>
-        <span>ORBIT B</span><span style={{ color: "#e0f0ff" }}>{rB.toFixed(1)}m / {OR}m</span>
+    <div style={{ background: "#0a1520e0", borderRadius: 5, padding: "4px 6px", border: "1px solid #c0602025", fontSize: 8, fontFamily: "monospace", color: "#8ab0c8", lineHeight: "13px" }}>
+      <div style={{ fontWeight: 700, color: "#c06020", marginBottom: 2, fontSize: 7, letterSpacing: 0.5 }}>TRIANG OPT</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <span>SEP <span style={{ color: "#e0f0ff" }}>{sepDeg.toFixed(0)}°/180°</span></span>
+        <span>GDOP <span style={{ color: qCol, fontWeight: 700 }}>{gdop.toFixed(1)}</span></span>
+        <span>A:<span style={{ color: "#e0f0ff" }}>{rA.toFixed(0)}m</span></span>
+        <span>B:<span style={{ color: "#e0f0ff" }}>{rB.toFixed(0)}m</span></span>
       </div>
-      <svg width="120" height="50" style={{ marginTop: 3 }}>
-        <circle cx="60" cy="28" r="3" fill="#d03030" />
-        <line x1="60" y1="28" x2={60 + 25 * Math.cos(angA)} y2={28 - 25 * Math.sin(angA)} stroke="#0a8a5a" strokeWidth="2" />
-        <line x1="60" y1="28" x2={60 + 25 * Math.cos(angB)} y2={28 - 25 * Math.sin(angB)} stroke="#4838d0" strokeWidth="2" />
-        <text x={60 + 28 * Math.cos(angA)} y={28 - 28 * Math.sin(angA)} style={{ fontSize: 8, fill: "#0a8a5a" }}>A</text>
-        <text x={60 + 28 * Math.cos(angB)} y={28 - 28 * Math.sin(angB)} style={{ fontSize: 8, fill: "#4838d0" }}>B</text>
-        <text x="60" y="8" textAnchor="middle" style={{ fontSize: 9, fill: qCol, fontWeight: 700 }}>{sepDeg.toFixed(0)}°</text>
+      <svg width="80" height="35" style={{ marginTop: 2 }}>
+        <circle cx="40" cy="20" r="2" fill="#d03030" />
+        <line x1="40" y1="20" x2={40 + 18 * Math.cos(angA)} y2={20 - 18 * Math.sin(angA)} stroke="#0a8a5a" strokeWidth="1.5" />
+        <line x1="40" y1="20" x2={40 + 18 * Math.cos(angB)} y2={20 - 18 * Math.sin(angB)} stroke="#4838d0" strokeWidth="1.5" />
+        <text x="40" y="8" textAnchor="middle" style={{ fontSize: 7, fill: qCol, fontWeight: 700 }}>{sepDeg.toFixed(0)}°</text>
       </svg>
     </div>
   );
@@ -682,48 +792,29 @@ function PathOptPanel({ st, triangPhaseIdx }) {
 // ════════════════════════════════════════════════════
 function CommDashboard({ comm, proto }) {
   var pc = PROTOCOLS[proto];
+  var pCol = pc.color;
   function sigBar(val, color) {
-    var bars = 5;
-    return <div style={{ display: "inline-flex", gap: 1, verticalAlign: "middle", marginLeft: 4 }}>
-      {Array.from({ length: bars }, function(_, i) {
-        var filled = val > (i / bars);
-        return <div key={i} style={{ width: 4, height: 6 + i * 2, background: filled ? color : "#333", borderRadius: 1 }} />;
-      })}
+    return <div style={{ display: "inline-flex", gap: 1, verticalAlign: "middle", marginLeft: 3 }}>
+      {[0,1,2,3,4].map(function(i) { return <div key={i} style={{ width: 3, height: 4 + i * 1.5, background: val > (i / 5) ? color : "#333", borderRadius: 1 }} />; })}
     </div>;
   }
-  var pCol = pc.color;
   return (
-    <div style={{ background: "#0a1520e0", borderRadius: 6, padding: "6px 8px", border: "1px solid " + pCol + "30", fontSize: 9, fontFamily: "monospace", color: "#8ab0c8" }}>
-      <div style={{ fontWeight: 700, color: pCol, marginBottom: 4, fontSize: 8, letterSpacing: 1 }}>COMM DASHBOARD — {pc.id}</div>
-      <div style={{ marginBottom: 4, color: "#6a8a9a", fontSize: 8 }}>{pc.desc}</div>
-      <div style={{ display: "grid", gridTemplateColumns: "55px 1fr", gap: "2px 6px", lineHeight: "15px" }}>
-        <span>ROUTE</span><span style={{ color: "#e0f0ff", fontWeight: 700 }}>{comm.route}</span>
-        <span>LATENCY</span><span style={{ color: comm.latency < 30 ? "#20d090" : comm.latency < 70 ? "#c89020" : "#c06020" }}>{comm.hasComm ? comm.latency.toFixed(0) + "ms" : "---"}</span>
-        <span>BW</span><span style={{ color: "#e0f0ff" }}>{comm.hasComm ? comm.bw.toFixed(2) + " Mbps" : "---"}</span>
+    <div style={{ background: "#0a1520e0", borderRadius: 5, padding: "4px 6px", border: "1px solid " + pCol + "25", fontSize: 8, fontFamily: "monospace", color: "#8ab0c8", lineHeight: "13px" }}>
+      <div style={{ fontWeight: 700, color: pCol, marginBottom: 2, fontSize: 7, letterSpacing: 0.5 }}>COMM — {pc.id}</div>
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <span>{comm.route}</span>
+        <span style={{ color: comm.latency < 30 ? "#20d090" : "#c89020" }}>{comm.hasComm ? comm.latency.toFixed(0) + "ms" : "---"}</span>
+        <span>{comm.hasComm ? comm.bw.toFixed(1) + "Mbps" : "---"}</span>
       </div>
-      <div style={{ marginTop: 4, fontSize: 8, color: "#6a8a9a" }}>LINK QUALITY</div>
-      <div style={{ display: "grid", gridTemplateColumns: "40px 1fr", gap: "2px 4px", lineHeight: "16px", marginTop: 2 }}>
-        {proto === "D2D" && <><span>A↔B</span><span>{sigBar(comm.sigAB, "#20d090")} <span style={{ color: "#e0f0ff" }}>{comm.dAB.toFixed(0)}m</span></span></>}
-        {proto === "D2G" && <>
-          <span>A↔GS</span><span>{sigBar(comm.sigAG, "#f0a030")} <span style={{ color: "#e0f0ff" }}>{comm.dAG.toFixed(0)}m</span></span>
-          <span>B↔GS</span><span>{sigBar(comm.sigBG, "#f0a030")} <span style={{ color: "#e0f0ff" }}>{comm.dBG.toFixed(0)}m</span></span>
-        </>}
+      <div style={{ display: "flex", gap: 6, marginTop: 2 }}>
+        {proto === "D2D" && <span>A↔B {sigBar(comm.sigAB, "#20d090")}</span>}
+        {proto === "D2G" && <><span>A↔GS {sigBar(comm.sigAG, "#f0a030")}</span><span>B↔GS {sigBar(comm.sigBG, "#f0a030")}</span></>}
       </div>
-      {/* Mini topology */}
-      <svg width="140" height="40" style={{ marginTop: 4 }}>
-        <circle cx="15" cy="20" r="7" fill={comm.hasComm ? "#0a8a5a" : "#333"} stroke="#0a8a5a" strokeWidth=".5" />
-        <text x="15" y="23" textAnchor="middle" style={{ fontSize: 7, fill: "#fff", fontWeight: 700 }}>A</text>
-        <circle cx="125" cy="20" r="7" fill={comm.hasComm ? "#4838d0" : "#333"} stroke="#4838d0" strokeWidth=".5" />
-        <text x="125" y="23" textAnchor="middle" style={{ fontSize: 7, fill: "#fff", fontWeight: 700 }}>B</text>
-        {proto === "D2G" && <>
-          <rect x="60" y="12" width="16" height="16" rx="2" fill={comm.hasComm ? "#f0a030" : "#333"} stroke="#f0a030" strokeWidth=".5" />
-          <text x="68" y="23" textAnchor="middle" style={{ fontSize: 6, fill: "#fff", fontWeight: 700 }}>GS</text>
-          <line x1="22" y1="20" x2="60" y2="20" stroke={comm.hasComm ? "#f0a030" : "#333"} strokeWidth="1.5" strokeDasharray="3 2" />
-          <line x1="76" y1="20" x2="118" y2="20" stroke={comm.hasComm ? "#f0a030" : "#333"} strokeWidth="1.5" strokeDasharray="3 2" />
-        </>}
-        {proto === "D2D" && <line x1="22" y1="20" x2="118" y2="20" stroke={comm.hasComm ? "#20d090" : "#333"} strokeWidth="2" />}
-        {proto === "D2D" && <text x="70" y="10" textAnchor="middle" style={{ fontSize: 7, fill: "#20d090" }}>DIRECT</text>}
-        {proto === "D2G" && <text x="68" y="8" textAnchor="middle" style={{ fontSize: 7, fill: "#f0a030" }}>RELAY</text>}
+      <svg width="100" height="22" style={{ marginTop: 2 }}>
+        <circle cx="10" cy="11" r="5" fill={comm.hasComm ? "#0a8a5a" : "#333"} /><text x="10" y="14" textAnchor="middle" style={{ fontSize: 6, fill: "#fff", fontWeight: 700 }}>A</text>
+        <circle cx="90" cy="11" r="5" fill={comm.hasComm ? "#4838d0" : "#333"} /><text x="90" y="14" textAnchor="middle" style={{ fontSize: 6, fill: "#fff", fontWeight: 700 }}>B</text>
+        {proto === "D2G" && <><rect x="43" y="5" width="14" height="12" rx="2" fill={comm.hasComm ? "#f0a030" : "#333"} /><text x="50" y="14" textAnchor="middle" style={{ fontSize: 5, fill: "#fff" }}>GS</text><line x1="15" y1="11" x2="43" y2="11" stroke={comm.hasComm ? "#f0a030" : "#333"} strokeWidth="1" strokeDasharray="2 2" /><line x1="57" y1="11" x2="85" y2="11" stroke={comm.hasComm ? "#f0a030" : "#333"} strokeWidth="1" strokeDasharray="2 2" /></>}
+        {proto === "D2D" && <line x1="15" y1="11" x2="85" y2="11" stroke={comm.hasComm ? "#20d090" : "#333"} strokeWidth="1.5" />}
       </svg>
     </div>
   );
@@ -736,29 +827,79 @@ export default function App() {
   var fpvBRef = useRef(null);
   var fpvBigRef = useRef(null);
   var initDone = useRef(false);
-  var [scenarioId, setScenarioId] = useState("s1");
   var [commProto, setCommProto] = useState("D2G");
   var [mapFull, setMapFull] = useState(false);
-  var [expandedFpv, setExpandedFpv] = useState(null); // null, "a", or "b"
-  var [tick, setTick] = useState(0);
-  var [playing, setPlaying] = useState(false);
-  var [speed, setSpeed] = useState(1);
-  var [mapWidth, setMapWidth] = useState(35); // percentage of viewport
+  var [running, setRunning] = useState(false);
+  var simMode = "manual";
+  var runningRef = useRef(false);
+  var simModeRef = useRef("manual");
+  var [expandedFpv, setExpandedFpv] = useState(null);
+  var [mapWidth, setMapWidth] = useState(35);
   var draggingDivider = useRef(false);
   var containerRef = useRef(null);
-  var tickRef = useRef(0);
-  var scenarioRef = useRef(scenarioId);
-  var raf = useRef(null);
-  var lastTime = useRef(null);
 
-  tickRef.current = tick;
-  scenarioRef.current = scenarioId;
+  // V6: Real-time simulation state
+  var simRef = useRef(initialSim());
+  var keysRef = useRef({ up: false, down: false, left: false, right: false });
+  var [renderState, setRenderState] = useState(function() { return simSnapshot(simRef.current); });
+  var simStateRef = useRef(renderState); // for 3D animate loop to read
+
   var protoRef = useRef(commProto);
   protoRef.current = commProto;
-  // Sync expanded FPV state to the ref in the 3D closure
+  runningRef.current = running;
+  // v6 is always manual mode
   if (mountRef.current && mountRef.current._expandedRef) {
     mountRef.current._expandedRef.current = expandedFpv;
   }
+
+  // Keyboard input for target control
+  useEffect(function() {
+    function onDown(e) {
+      if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") keysRef.current.up = true;
+      if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") keysRef.current.down = true;
+      if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") keysRef.current.left = true;
+      if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") keysRef.current.right = true;
+    }
+    function onUp(e) {
+      if (e.key === "ArrowUp" || e.key === "w" || e.key === "W") keysRef.current.up = false;
+      if (e.key === "ArrowDown" || e.key === "s" || e.key === "S") keysRef.current.down = false;
+      if (e.key === "ArrowLeft" || e.key === "a" || e.key === "A") keysRef.current.left = false;
+      if (e.key === "ArrowRight" || e.key === "d" || e.key === "D") keysRef.current.right = false;
+    }
+    window.addEventListener("keydown", onDown);
+    window.addEventListener("keyup", onUp);
+    return function() { window.removeEventListener("keydown", onDown); window.removeEventListener("keyup", onUp); };
+  }, []);
+
+  // Real-time simulation loop (fixed timestep)
+  useEffect(function() {
+    var lastT = performance.now();
+    var accum = 0;
+    var SIM_DT = 1 / 60;
+    var frameCount = 0;
+    function loop(now) {
+      var frameMs = Math.min(now - lastT, 100);
+      lastT = now;
+      if (runningRef.current && !simRef.current.blasted) {
+        accum += frameMs / 1000;
+        while (accum >= SIM_DT) {
+          simRef.current.mode = "manual";
+          stepSim(simRef.current, keysRef.current, SIM_DT);
+          accum -= SIM_DT;
+        }
+      }
+      frameCount++;
+      if (frameCount % 2 === 0) { // update React state at 30fps
+        var snap = simSnapshot(simRef.current);
+        simStateRef.current = snap;
+        setRenderState(snap);
+      } else {
+        simStateRef.current = simSnapshot(simRef.current);
+      }
+      requestAnimationFrame(loop);
+    }
+    requestAnimationFrame(loop);
+  }, []);
 
   // 3D Scene - one-time init
   useEffect(function() {
@@ -914,6 +1055,20 @@ export default function App() {
     var dB = mkBoat(0x3030b0, 0x4848d8, 0x4838d0); scene.add(dB);
     var tgt = mkBoat(0xc03030, 0xe04040, 0xd03030); scene.add(tgt);
 
+    // 3D Playground boundary (red dashed rectangle on water)
+    var bw = BOUNDS.xMax - BOUNDS.xMin, bh = BOUNDS.zMax - BOUNDS.zMin;
+    var bcx = (BOUNDS.xMin + BOUNDS.xMax) / 2, bcz = (BOUNDS.zMin + BOUNDS.zMax) / 2;
+    var boundaryGeo = new THREE.BufferGeometry().setFromPoints([
+      new THREE.Vector3(BOUNDS.xMin, 0.2, BOUNDS.zMin),
+      new THREE.Vector3(BOUNDS.xMax, 0.2, BOUNDS.zMin),
+      new THREE.Vector3(BOUNDS.xMax, 0.2, BOUNDS.zMax),
+      new THREE.Vector3(BOUNDS.xMin, 0.2, BOUNDS.zMax),
+      new THREE.Vector3(BOUNDS.xMin, 0.2, BOUNDS.zMin)
+    ]);
+    var boundaryLine = new THREE.Line(boundaryGeo, new THREE.LineDashedMaterial({ color: 0xc03030, transparent: true, opacity: 0.25, dashSize: 3, gapSize: 2 }));
+    boundaryLine.computeLineDistances();
+    scene.add(boundaryLine);
+
     // Ground Station 3D model
     var gsGroup = new THREE.Group();
     var gsPlatform = new THREE.Mesh(new THREE.BoxGeometry(4, 0.8, 4), new THREE.MeshStandardMaterial({ color: 0x2a3a4a, roughness: 0.4, metalness: 0.6 }));
@@ -936,6 +1091,18 @@ export default function App() {
     for (var dp = 0; dp < 6; dp++) { var dpm = new THREE.Mesh(new THREE.OctahedronGeometry(0.3), new THREE.MeshBasicMaterial({ color: 0xf0a030, transparent: true, opacity: 0.9 })); dpm.visible = false; scene.add(dpm); d2gPkts.push(dpm); }
     var gsRelayRings = [];
     for (var gr = 0; gr < 3; gr++) { var grm = new THREE.Mesh(new THREE.RingGeometry(1, 1.3, 32), new THREE.MeshBasicMaterial({ color: 0xf0a030, transparent: true, opacity: .3, side: THREE.DoubleSide })); grm.rotation.x = -Math.PI / 2; grm.visible = false; scene.add(grm); gsRelayRings.push(grm); }
+
+    // Explosion effects
+    var blastSphere = new THREE.Mesh(new THREE.SphereGeometry(1, 16, 16), new THREE.MeshBasicMaterial({ color: 0xff4400, transparent: true, opacity: 0.9 }));
+    blastSphere.visible = false; scene.add(blastSphere);
+    var blastRings = [];
+    for (var br = 0; br < 5; br++) {
+      var brm = new THREE.Mesh(new THREE.RingGeometry(0.5, 1, 32), new THREE.MeshBasicMaterial({ color: br < 2 ? 0xff6600 : 0xff2200, transparent: true, opacity: 0.7, side: THREE.DoubleSide }));
+      brm.rotation.x = -Math.PI / 2; brm.visible = false; scene.add(brm);
+      blastRings.push(brm);
+    }
+    var blastFlash = new THREE.PointLight(0xff4400, 0, 100);
+    scene.add(blastFlash);
 
     function mkLine(c, o) {
       var l = new THREE.Line(new THREE.BufferGeometry().setFromPoints([new THREE.Vector3(), new THREE.Vector3()]), new THREE.LineBasicMaterial({ color: c, transparent: true, opacity: o }));
@@ -1100,10 +1267,8 @@ export default function App() {
 
     function animate() {
       requestAnimationFrame(animate);
-      var tk = tickRef.current;
-      var curSc = getScenario(scenarioRef.current);
-      var st = curSc.posAt(tk);
-      var stopped = tk >= curSc.PE[curSc.triangPhaseIdx];
+      var st = simStateRef.current;
+      var stopped = false; // never stops in v6 real-time mode
       var time = Date.now() * .001;
 
       // Realistic ocean waves — multiple overlapping sine waves
@@ -1144,9 +1309,39 @@ export default function App() {
       var fleeing = st.pi >= 2 && !stopped;
       tgt.rotation.z = fleeing ? Math.sin(time * 3.5 + 3) * .1 : rock(3);
       tgt.rotation.x = fleeing ? Math.sin(time * 2.8) * .06 : pitch(3);
-      if (!stopped) {
-        var tp = curSc.tAt(Math.max(0, tk - 3));
-        tgt.rotation.y = -Math.atan2(st.tg.z - tp.z, st.tg.x - tp.x);
+      tgt.rotation.y = -simRef.current.target.heading;
+
+      // Blast animation
+      var curSim = simRef.current;
+      if (curSim.blasted) {
+        var bt = time - (curSim.blastTime ? curSim.blastTime * 0.001 : time); // use real time offset
+        var blastAge = curSim.elapsed - curSim.blastTime;
+        // Hide drones and target after blast
+        if (blastAge > 0.5) { dA.visible = false; dB.visible = false; tgt.visible = false; }
+        // Fireball
+        blastSphere.visible = true;
+        blastSphere.position.set(st.tg.x, 2 + blastAge * 3, st.tg.z);
+        var bScale = Math.min(blastAge * 15, 12) * (1 - Math.min(blastAge / 4, 1) * 0.5);
+        blastSphere.scale.set(bScale, bScale, bScale);
+        blastSphere.material.opacity = Math.max(0, 1 - blastAge / 3);
+        blastSphere.material.color.setHex(blastAge < 0.5 ? 0xffff00 : blastAge < 1.5 ? 0xff6600 : 0x333333);
+        // Expanding shockwave rings
+        for (var bri = 0; bri < blastRings.length; bri++) {
+          blastRings[bri].visible = true;
+          blastRings[bri].position.set(st.tg.x, 0.3 + bri * 0.5, st.tg.z);
+          var ringAge = Math.max(0, blastAge - bri * 0.15);
+          var ringScale = ringAge * 20 + bri * 3;
+          blastRings[bri].scale.set(ringScale, ringScale, ringScale);
+          blastRings[bri].material.opacity = Math.max(0, 0.7 - ringAge * 0.3);
+        }
+        // Flash light
+        blastFlash.position.set(st.tg.x, 5, st.tg.z);
+        blastFlash.intensity = Math.max(0, 50 - blastAge * 25);
+      } else {
+        blastSphere.visible = false;
+        for (var bri2 = 0; bri2 < blastRings.length; bri2++) blastRings[bri2].visible = false;
+        blastFlash.intensity = 0;
+        dA.visible = true; dB.visible = true; tgt.visible = true;
       }
 
       // 3D FOV cones — rebuild vertices from world coords (same math as 2D map)
@@ -1192,7 +1387,7 @@ export default function App() {
       if (dB.userData.tip) dB.userData.tip.material.opacity = blinkB;
 
       // Wake foam particles behind moving boats
-      if (tk > 0 && tk % 2 === 0) {
+      if (Math.random() < 0.3) { // spawn wake particles ~30% of frames
         var boats = [st.aP, st.bP, st.tg];
         for (var bi = 0; bi < boats.length; bi++) {
           var wp = wakeIdx % wakeCount;
@@ -1231,7 +1426,7 @@ export default function App() {
       if (stopped) { idleRing.position.set(st.tg.x, .1, st.tg.z); idleRing.material.opacity = .15 + .08 * Math.sin(time * 1.5); }
 
       // Packets (bearing data once both tracking)
-      var pp = (tk * .05) % 1;
+      var pp = (time * 2) % 1;
       if (st.cm && st.aD && !st.commAB) {
         var toX = st.bD ? st.bP.x : st.tg.x, toZ = st.bD ? st.bP.z : st.tg.z;
         pkt1.visible = true;
@@ -1344,16 +1539,13 @@ export default function App() {
           tr.line.geometry.setDrawRange(0, tr.count);
         }
       }
-      if (tk % 3 === 0 && tk > 0) {
-        pushT(trA, st.aP.x, st.aP.z);
-        pushT(trB, st.bP.x, st.bP.z);
-        if (st.pi >= 2) pushT(trT, st.tg.x, st.tg.z);
-      }
-
-      // Reset trails when tick is 0
-      if (tk === 0) {
-        [trA, trB, trT].forEach(function(tr) { tr.count = 0; tr.line.geometry.setDrawRange(0, 0); });
-      }
+      // 3D trails — time-based (sim accumulates trails)
+      var simTrailA = simRef.current.aTrail;
+      var simTrailB = simRef.current.bTrail;
+      var simTrailT = simRef.current.tTrail;
+      if (simTrailA.length > trA.count) { for (var ti = trA.count; ti < Math.min(simTrailA.length, trA.max); ti++) pushT(trA, simTrailA[ti].x, simTrailA[ti].z); }
+      if (simTrailB.length > trB.count) { for (var tj = trB.count; tj < Math.min(simTrailB.length, trB.max); tj++) pushT(trB, simTrailB[tj].x, simTrailB[tj].z); }
+      if (simTrailT.length > trT.count) { for (var tk2 = trT.count; tk2 < Math.min(simTrailT.length, trT.max); tk2++) pushT(trT, simTrailT[tk2].x, simTrailT[tk2].z); }
 
       // Camera
       var lookX = st.tg.x * .4, lookZ = st.tg.z * .4 + 4;
@@ -1424,7 +1616,7 @@ export default function App() {
     }
 
     // FPV renderers (share scene, small resolution, no shadows)
-    var fpvW = 200, fpvHt = 140;
+    var fpvW = 160, fpvHt = 100;
     var fpvRendererA = null, fpvRendererB = null, fpvCamA = null, fpvCamB = null;
     if (fpvARef.current && fpvBRef.current) {
       fpvRendererA = new THREE.WebGLRenderer({ canvas: fpvARef.current, antialias: false });
@@ -1453,22 +1645,6 @@ export default function App() {
 
     animate();
   }, []);
-
-  // Playback loop
-  var loop = useCallback(function(ts) {
-    if (!lastTime.current) lastTime.current = ts;
-    if (ts - lastTime.current > 1000 / (42 * speed)) {
-      lastTime.current = ts;
-      setTick(function(p) { if (p >= TOTAL - 1) { setPlaying(false); return TOTAL - 1; } return p + 1; });
-    }
-    raf.current = requestAnimationFrame(loop);
-  }, [speed]);
-
-  useEffect(function() {
-    if (playing) { lastTime.current = null; raf.current = requestAnimationFrame(loop); }
-    else if (raf.current) cancelAnimationFrame(raf.current);
-    return function() { if (raf.current) cancelAnimationFrame(raf.current); };
-  }, [playing, loop]);
 
   // Divider drag handlers
   var onDividerDown = useCallback(function(e) {
@@ -1505,16 +1681,12 @@ export default function App() {
     };
   }, []);
 
-  var sc = getScenario(scenarioId);
-  var phase = sc.gp(tick);
-  var ph = sc.PHASES[phase.i];
-  var ts = tick >= sc.PE[sc.triangPhaseIdx];
-  var st = sc.posAt(tick);
+  var st = renderState;
+  var sim = simRef.current;
 
   // Derived IMU data
-  var prevSt = tick > 0 ? sc.posAt(tick - 1) : st;
-  var aSpeed = d3(st.aP, prevSt.aP) / TICK_DT;
-  var bSpeed = d3(st.bP, prevSt.bP) / TICK_DT;
+  var aSpeed = sim.droneA.speed;
+  var bSpeed = sim.droneB.speed;
   var now = Date.now() * 0.001;
   var aRoll = Math.sin(now * 1.6) * 0.05 + Math.cos(now * 2.3) * 0.025;
   var aPitch = Math.sin(now * 1.3) * 0.03;
@@ -1524,27 +1696,25 @@ export default function App() {
   var bBearing = Math.atan2(st.tg.z - st.bP.z, st.tg.x - st.bP.x);
   var aDist = d3(st.aP, st.tg), bDist = d3(st.bP, st.tg);
   var comm = commState(st.aP, st.bP, st.commAB, st.commBA, commProto);
-  var instructions = getInstructions(scenarioId, sc, tick, commProto);
+  var instructions = getInstructions(sim, st, commProto);
 
   var btn = { border: "none", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 11, borderRadius: 6, padding: "7px 18px" };
 
   return (
     <div style={{ fontFamily: "monospace", color: "#2a3a4a", background: "#fff", overflow: "hidden", width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "8px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#f8fafb", borderBottom: "1px solid #e8eff5" }}>
+      <div style={{ padding: "4px 10px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#f8fafb", borderBottom: "1px solid #e8eff5" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-          <div style={{ width: 7, height: 7, borderRadius: "50%", background: playing ? "#0a8a5a" : "#c0ccd4" }} />
+          <div style={{ width: 7, height: 7, borderRadius: "50%", background: "#0a8a5a" }} />
           <span style={{ fontSize: 14, fontWeight: 800, color: "#0a8a5a", letterSpacing: 1.5 }}>SEADRONE</span>
           <span style={{ fontSize: 14, fontWeight: 300, color: "#8a9aaa" }}>MULTI-AGENT</span>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 11 }}>
-          <select value={scenarioId} onChange={function(e) { setScenarioId(e.target.value); setPlaying(false); setTick(0); scenarioCache = {}; }} style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 600, padding: "4px 8px", borderRadius: 5, border: "1px solid #d0dae4", background: "#f2f6f9", color: "#2a3a4a", cursor: "pointer" }}>
-            {Object.values(SCENARIOS).map(function(s) { return <option key={s.id} value={s.id}>{s.name}</option>; })}
-          </select>
+          <span style={{ fontSize: 9, fontWeight: 700, color: "#c03030", background: "#c0303015", padding: "2px 8px", borderRadius: 4 }}>MANUAL MODE</span>
           <select value={commProto} onChange={function(e) { setCommProto(e.target.value); }} style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 600, padding: "4px 8px", borderRadius: 5, border: "1px solid " + PROTOCOLS[commProto].color + "60", background: PROTOCOLS[commProto].color + "15", color: PROTOCOLS[commProto].color, cursor: "pointer" }}>
             {Object.values(PROTOCOLS).map(function(p) { return <option key={p.id} value={p.id}>{p.name}</option>; })}
           </select>
-          {(function() { var info = sc.statusText(st, phase, ts); return info ? <span style={{ color: info.color, fontWeight: 700 }}>{info.icon} {info.text}</span> : null; })()}
-          <span style={{ color: "#b0bcc8", fontSize: 10 }}>T+{(tick / TOTAL * 65).toFixed(1)}s</span>
+          {(function() { var info = simStatusText(sim); return info ? <span style={{ color: info.color, fontWeight: 700 }}>{info.icon} {info.text}</span> : null; })()}
+          <span style={{ color: "#b0bcc8", fontSize: 10 }}>T+{sim.elapsed.toFixed(1)}s</span>
         </div>
       </div>
 
@@ -1553,25 +1723,25 @@ export default function App() {
           <div style={{ position: "absolute", top: 8, left: 10, fontSize: 9, fontWeight: 700, color: "#0a8a5a", background: "#f8fafbdd", padding: "2px 8px", borderRadius: 4, border: "1px solid #e0e8f0", zIndex: 1 }}>3D VIEW</div>
           <div style={{ position: "absolute", bottom: 8, left: 10, fontSize: 8, color: "#a0b0c0", zIndex: 1 }}>Drag · Scroll</div>
 
-          {/* Drone A — FPV + IMU (top-left) */}
-          <div style={{ position: "absolute", top: 30, left: 10, zIndex: 2, cursor: "pointer" }} onClick={function() { setExpandedFpv(expandedFpv === "a" ? null : "a"); }}>
-            <div style={{ fontSize: 8, fontWeight: 700, color: "#0a8a5a", background: "#0a1520e8", padding: "2px 6px", borderRadius: "4px 4px 0 0", letterSpacing: 1, borderBottom: "1px solid #0a8a5a40", display: "flex", justifyContent: "space-between" }}>
-              <span>DRONE A — FPV</span><span style={{ color: "#6a8a9a", fontSize: 7 }}>{expandedFpv === "a" ? "▼ CLOSE" : "▲ EXPAND"}</span>
+          {/* Drone A — FPV + IMU (top-left, compact) */}
+          <div style={{ position: "absolute", top: 28, left: 8, zIndex: 2, cursor: "pointer", opacity: 0.95 }} onClick={function() { setExpandedFpv(expandedFpv === "a" ? null : "a"); }}>
+            <div style={{ fontSize: 7, fontWeight: 700, color: "#0a8a5a", background: "#0a1520", padding: "2px 5px", borderRadius: "4px 4px 0 0", display: "flex", justifyContent: "space-between", letterSpacing: 0.5 }}>
+              <span>A — CAM</span><span style={{ color: "#4a6a7a", fontSize: 6 }}>{expandedFpv === "a" ? "CLOSE" : "EXPAND"}</span>
             </div>
             <div style={{ position: "relative" }}>
-              <canvas ref={fpvARef} width={200} height={140} style={{ display: "block", borderLeft: "2px solid #0a8a5a40", borderRight: "2px solid #0a8a5a40" }} />
+              <canvas ref={fpvARef} width={160} height={100} style={{ display: "block", border: "1px solid #0a8a5a30" }} />
               <FPVOverlay heading={st.aHeading || 0} inRange={st.aInRange} dist={aDist} color="#0a8a5a" />
             </div>
             <IMUPanel label="A" color="#0a8a5a" pos={st.aP} heading={st.aHeading || 0} speed={aSpeed} roll={aRoll} pitch={aPitch} bearing={aBearing} dist={aDist} inRange={st.aInRange} />
           </div>
 
-          {/* Drone B — FPV + IMU (top-right) */}
-          <div style={{ position: "absolute", top: 30, right: 10, zIndex: 2, cursor: "pointer" }} onClick={function() { setExpandedFpv(expandedFpv === "b" ? null : "b"); }}>
-            <div style={{ fontSize: 8, fontWeight: 700, color: "#4838d0", background: "#0a1520e8", padding: "2px 6px", borderRadius: "4px 4px 0 0", letterSpacing: 1, borderBottom: "1px solid #4838d040", display: "flex", justifyContent: "space-between" }}>
-              <span>DRONE B — FPV</span><span style={{ color: "#6a8a9a", fontSize: 7 }}>{expandedFpv === "b" ? "▼ CLOSE" : "▲ EXPAND"}</span>
+          {/* Drone B — FPV + IMU (top-right, compact) */}
+          <div style={{ position: "absolute", top: 28, right: 8, zIndex: 2, cursor: "pointer", opacity: 0.95 }} onClick={function() { setExpandedFpv(expandedFpv === "b" ? null : "b"); }}>
+            <div style={{ fontSize: 7, fontWeight: 700, color: "#4838d0", background: "#0a1520", padding: "2px 5px", borderRadius: "4px 4px 0 0", display: "flex", justifyContent: "space-between", letterSpacing: 0.5 }}>
+              <span>B — CAM</span><span style={{ color: "#4a6a7a", fontSize: 6 }}>{expandedFpv === "b" ? "CLOSE" : "EXPAND"}</span>
             </div>
             <div style={{ position: "relative" }}>
-              <canvas ref={fpvBRef} width={200} height={140} style={{ display: "block", borderLeft: "2px solid #4838d040", borderRight: "2px solid #4838d040" }} />
+              <canvas ref={fpvBRef} width={160} height={100} style={{ display: "block", border: "1px solid #4838d030" }} />
               <FPVOverlay heading={st.bHeading || 0} inRange={st.bInRange} dist={bDist} color="#4838d0" />
             </div>
             <IMUPanel label="B" color="#4838d0" pos={st.bP} heading={st.bHeading || 0} speed={bSpeed} roll={bRoll} pitch={bPitch} bearing={bBearing} dist={bDist} inRange={st.bInRange} />
@@ -1599,8 +1769,8 @@ export default function App() {
             </div>
           </div>}
 
-          {/* Instruction Comm Log (bottom-left) */}
-          <div style={{ position: "absolute", bottom: 28, left: 10, zIndex: 2 }}>
+          {/* Instruction Comm Log (bottom-left, compact) */}
+          <div style={{ position: "absolute", bottom: 24, left: 8, zIndex: 2, maxWidth: 280, opacity: 0.9 }}>
             <InstructionLog messages={instructions} />
           </div>
         </div>
@@ -1628,16 +1798,16 @@ export default function App() {
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
             <span style={{ fontSize: 10, fontWeight: 700, color: "#1a80c0", letterSpacing: .8 }}>SPATIAL MAP</span>
             <div style={{ display: "flex", gap: 6, alignItems: "center" }}>
-              {st.pi >= sc.triangPhaseIdx && <span style={{ fontSize: 8, fontWeight: 700, color: "#c06020", background: "#c0602015", padding: "2px 6px", borderRadius: 3 }}>TRIANG ACTIVE</span>}
+              {st.pi >= 5 && <span style={{ fontSize: 8, fontWeight: 700, color: "#c06020", background: "#c0602015", padding: "2px 6px", borderRadius: 3 }}>TRIANG ACTIVE</span>}
               <button onClick={function() { setMapFull(!mapFull); }} style={{ border: "1px solid #d0dae4", background: mapFull ? "#edf8f3" : "#f2f6f9", color: mapFull ? "#0a8a5a" : "#6a7a8a", cursor: "pointer", fontFamily: "monospace", fontSize: 9, fontWeight: 600, borderRadius: 4, padding: "2px 8px" }}>
                 {mapFull ? "Show Panels" : "Expand Map"}
               </button>
             </div>
           </div>
-          <Map2D tick={tick} scenario={sc} proto={commProto} />
+          <Map2D state={st} trail={{ a: sim.aTrail, b: sim.bTrail, t: sim.tTrail }} proto={commProto} elapsed={sim.elapsed} blasted={sim.blasted} />
           {!mapFull && <div style={{ display: "flex", gap: 6 }}>
             <div style={{ flex: 1 }}><CommDashboard comm={comm} proto={commProto} /></div>
-            <div style={{ flex: 1 }}><PathOptPanel st={st} triangPhaseIdx={sc.triangPhaseIdx} /></div>
+            <div style={{ flex: 1 }}><PathOptPanel st={st} triangPhaseIdx={5} /></div>
           </div>}
           {!mapFull && <div style={{ display: "flex", gap: 10, fontSize: 9, color: "#6a7a8a", flexWrap: "wrap" }}>
             <span style={{ display: "flex", alignItems: "center", gap: 3 }}><span style={{ display: "inline-block", width: 0, height: 0, borderLeft: "4px solid transparent", borderRight: "4px solid transparent", borderBottom: "7px solid #0a8a5a" }} />A</span>
@@ -1652,32 +1822,46 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{ padding: "8px 14px 10px", background: "#f8fafb", borderTop: "1px solid #e8eff5" }}>
-        <div style={{ display: "flex", gap: 2, marginBottom: 6 }}>
-          {sc.PHASES.map(function(p, idx) {
-            var start = idx === 0 ? 0 : sc.PE[idx - 1];
-            var act = idx <= phase.i, cur = idx === phase.i;
-            return <div key={idx} style={{ flex: p.dur, cursor: "pointer" }} onClick={function() { setPlaying(false); setTick(start); }}>
-              <div style={{ height: 5, borderRadius: 3, background: act ? p.c : "#e4ecf2", opacity: cur ? 1 : act ? .45 : .25, position: "relative" }}>
-                {cur && <div style={{ position: "absolute", left: (phase.t * 100) + "%", top: -2, width: 4, height: 9, borderRadius: 2, background: "#2a3a4a" }} />}
-              </div>
-              <div style={{ fontSize: 8, textAlign: "center", fontWeight: cur ? 700 : 400, color: cur ? p.c : act ? "#8a9aaa" : "#c0ccd8", marginTop: 3 }}>{p.label}</div>
-            </div>;
-          })}
-        </div>
-        <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
-          <button style={{ ...btn, background: playing ? "#fef2f2" : "#edf8f3", color: playing ? "#c03030" : "#0a8a5a", border: "1px solid " + (playing ? "#c0303025" : "#0a8a5a25") }}
-            onClick={function() { if (tick >= TOTAL - 1) setTick(0); setPlaying(!playing); }}>
-            {playing ? "Pause" : tick >= TOTAL - 1 ? "Replay" : "▶ Play"}
-          </button>
-          <button style={{ ...btn, background: "#f2f6f9", color: "#8a9aaa", border: "1px solid #dce6ef" }} onClick={function() { setPlaying(false); setTick(0); }}>Reset</button>
-          <div style={{ display: "flex", gap: 2, background: "#f2f6f9", borderRadius: 6, padding: 2, border: "1px solid #e4ecf2" }}>
-            {[.5, 1, 2, 3].map(function(s) {
-              return <button key={s} onClick={function() { setSpeed(s); }} style={{ border: "none", cursor: "pointer", fontFamily: "monospace", fontSize: 10, fontWeight: speed === s ? 700 : 400, padding: "4px 10px", borderRadius: 4, background: speed === s ? "#fff" : "transparent", color: speed === s ? "#0a8a5a" : "#a0b0c0", boxShadow: speed === s ? "0 1px 3px #0001" : "none" }}>{s}x</button>;
-            })}
+      <div style={{ padding: "4px 10px 5px", background: "#f8fafb", borderTop: "1px solid #e8eff5" }}>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, fontFamily: "monospace", fontSize: 10 }}>
+          {/* Drone A state */}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: sim.droneA.state === "SEARCH" ? "#1a80c0" : sim.droneA.state === "TRIANGULATE" ? "#0a8a5a" : "#c89020" }} />
+            <span style={{ fontWeight: 700, color: "#0a8a5a" }}>A: {sim.droneA.state}</span>
           </div>
-          <input type="range" min="0" max={TOTAL - 1} value={tick} onChange={function(e) { setPlaying(false); setTick(+e.target.value); }} style={{ flex: 1, accentColor: ph.c }} />
-          <span style={{ fontSize: 10, color: "#b0bcc8", minWidth: 30, textAlign: "right" }}>{Math.round(tick / TOTAL * 100)}%</span>
+          {/* Drone B state */}
+          <div style={{ display: "flex", alignItems: "center", gap: 4 }}>
+            <div style={{ width: 8, height: 8, borderRadius: "50%", background: sim.droneB.state === "SEARCH" ? "#1a80c0" : sim.droneB.state === "TRIANGULATE" ? "#0a8a5a" : "#c89020" }} />
+            <span style={{ fontWeight: 700, color: "#4838d0" }}>B: {sim.droneB.state}</span>
+          </div>
+          <div style={{ width: 1, height: 16, background: "#d0e0e8" }} />
+          {/* Target steering info */}
+          <div style={{ display: "flex", alignItems: "center", gap: 6, color: "#c03030" }}>
+            <span style={{ fontWeight: 700 }}>TARGET</span>
+            <span>HDG {((sim.target.heading * 180 / Math.PI + 360) % 360).toFixed(0)}°</span>
+            <span>SPD {sim.target.speed.toFixed(1)} m/s</span>
+            <div style={{ width: 60, height: 6, background: "#e4ecf2", borderRadius: 3, overflow: "hidden" }}>
+              <div style={{ width: (sim.target.speed / TARGET_MAX_SPEED * 100) + "%", height: "100%", background: "#c03030", borderRadius: 3 }} />
+            </div>
+          </div>
+          <div style={{ width: 1, height: 16, background: "#d0e0e8" }} />
+          <div style={{ display: "flex", gap: 2, alignItems: "center" }}>
+            <span style={{ background: "#e4ecf2", padding: "1px 5px", borderRadius: 3, fontWeight: 700, fontSize: 8 }}>W</span>
+            <span style={{ background: "#e4ecf2", padding: "1px 5px", borderRadius: 3, fontWeight: 700, fontSize: 8 }}>A</span>
+            <span style={{ background: "#e4ecf2", padding: "1px 5px", borderRadius: 3, fontWeight: 700, fontSize: 8 }}>S</span>
+            <span style={{ background: "#e4ecf2", padding: "1px 5px", borderRadius: 3, fontWeight: 700, fontSize: 8 }}>D</span>
+            <span style={{ color: "#8a9aaa", fontSize: 7 }}>steer</span>
+          </div>
+          <div style={{ flex: 1 }} />
+          <button onClick={function() { setRunning(!running); }} style={{ border: "1px solid " + (running ? "#c0303025" : "#0a8a5a25"), background: running ? "#fef2f2" : "#edf8f3", color: running ? "#c03030" : "#0a8a5a", cursor: "pointer", fontFamily: "monospace", fontWeight: 700, fontSize: 11, borderRadius: 6, padding: "5px 18px" }}>
+            {running ? "Stop" : "▶ Start"}
+          </button>
+          <button onClick={function() { setRunning(false); simRef.current = initialSim(); debugLog.length = 0; debugLastSnapshot = 0; debugPrevStateA = ""; debugPrevStateB = ""; }} style={{ border: "1px solid #dce6ef", background: "#f2f6f9", color: "#8a9aaa", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 10, borderRadius: 6, padding: "5px 14px" }}>Reset</button>
+          <button onClick={function() {
+            var blob = new Blob([JSON.stringify({ log: debugLog, totalEntries: debugLog.length }, null, 2)], { type: "application/json" });
+            var a = document.createElement("a"); a.href = URL.createObjectURL(blob); a.download = "debug_sim_" + Date.now() + ".json"; a.click();
+          }} style={{ border: "1px solid #c89020", background: "#fef8e8", color: "#8a6a2a", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 10, borderRadius: 6, padding: "5px 14px" }}>Debug Log ({debugLog.length})</button>
+          <span style={{ color: "#b0bcc8" }}>T+{sim.elapsed.toFixed(1)}s</span>
         </div>
       </div>
     </div>
