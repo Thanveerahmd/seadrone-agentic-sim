@@ -1529,8 +1529,8 @@ export default function App() {
   var btn = { border: "none", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 11, borderRadius: 6, padding: "7px 18px" };
 
   return (
-    <div style={{ fontFamily: "monospace", color: "#2a3a4a", background: "#fff", overflow: "hidden", width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "8px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#f8fafb", borderBottom: "1px solid #e8eff5" }}>
+    <div style={{ fontFamily: "'JetBrains Mono', monospace", color: "#c0d0e0", background: "#080c12", overflow: "hidden", width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "4px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#0c1018", borderBottom: "1px solid #141e2a", height: 32 }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", background: playing ? "#0a8a5a" : "#c0ccd4" }} />
           <span style={{ fontSize: 14, fontWeight: 800, color: "#0a8a5a", letterSpacing: 1.5 }}>SEADRONE</span>
@@ -1549,7 +1549,7 @@ export default function App() {
       </div>
 
       <div ref={containerRef} style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        <div ref={mountRef} style={{ flex: 1, cursor: "grab", position: "relative", background: "#eef3f8", minWidth: 0 }}>
+        <div ref={mountRef} style={{ flex: 1, cursor: "grab", position: "relative", background: "#0a1018", minWidth: 0 }}>
           <div style={{ position: "absolute", top: 8, left: 10, fontSize: 9, fontWeight: 700, color: "#0a8a5a", background: "#f8fafbdd", padding: "2px 8px", borderRadius: 4, border: "1px solid #e0e8f0", zIndex: 1 }}>3D VIEW</div>
           <div style={{ position: "absolute", bottom: 8, left: 10, fontSize: 8, color: "#a0b0c0", zIndex: 1 }}>Drag · Scroll</div>
 
@@ -1609,7 +1609,7 @@ export default function App() {
           onMouseDown={onDividerDown}
           onTouchStart={onDividerDown}
           style={{
-            width: 6, cursor: "col-resize", background: "#e0e8f0", flexShrink: 0,
+            width: 4, cursor: "col-resize", background: "#141e2a", flexShrink: 0,
             display: "flex", alignItems: "center", justifyContent: "center",
             transition: "background 0.15s"
           }}
@@ -1622,7 +1622,7 @@ export default function App() {
           width: mapWidth + "%",
           flexShrink: 0,
           padding: 10,
-          background: "#fafcfe",
+          background: "#0c1018",
           display: "flex", flexDirection: "column", gap: 6
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1652,7 +1652,7 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{ padding: "8px 14px 10px", background: "#f8fafb", borderTop: "1px solid #e8eff5" }}>
+      <div style={{ padding: "4px 12px 6px", background: "#0c1018", borderTop: "1px solid #141e2a" }}>
         <div style={{ display: "flex", gap: 2, marginBottom: 6 }}>
           {sc.PHASES.map(function(p, idx) {
             var start = idx === 0 ? 0 : sc.PE[idx - 1];
