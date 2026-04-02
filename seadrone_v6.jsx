@@ -902,7 +902,7 @@ export default function App() {
     var renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false });
     renderer.setSize(w, h);
     renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    renderer.setClearColor(0x87ceeb);
+    renderer.setClearColor(0x0a1520);
     renderer.shadowMap.enabled = true;
     renderer.shadowMap.type = THREE.PCFSoftShadowMap;
     renderer.toneMapping = THREE.ACESFilmicToneMapping;
@@ -913,73 +913,173 @@ export default function App() {
     renderer.domElement.style.display = "block";
 
     var scene = new THREE.Scene();
-    scene.fog = new THREE.FogExp2(0x8abcd4, 0.0025);
+    scene.fog = new THREE.FogExp2(0x1a3550, 0.002);
 
-    // Sky dome
-    var skyGeo = new THREE.SphereGeometry(400, 32, 15);
+    // ═══ CINEMATIC SKY ═══
+    var skyGeo = new THREE.SphereGeometry(500, 64, 32);
     var skyMat = new THREE.ShaderMaterial({
       side: THREE.BackSide,
       uniforms: {
-        topColor: { value: new THREE.Color(0x3a7ec5) },
-        bottomColor: { value: new THREE.Color(0xc8e4f8) },
-        offset: { value: 20 },
-        exponent: { value: 0.4 }
+        sunPosition: { value: new THREE.Vector3(0.4, 0.15, -1.0) }
       },
-      vertexShader: "varying vec3 vWorldPosition; void main() { vec4 wp = modelMatrix * vec4(position, 1.0); vWorldPosition = wp.xyz; gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0); }",
-      fragmentShader: "uniform vec3 topColor; uniform vec3 bottomColor; uniform float offset; uniform float exponent; varying vec3 vWorldPosition; void main() { float h = normalize(vWorldPosition + offset).y; gl_FragColor = vec4(mix(bottomColor, topColor, max(pow(max(h, 0.0), exponent), 0.0)), 1.0); }"
+      vertexShader: [
+        "varying vec3 vWorldPos;",
+        "void main() {",
+        "  vec4 wp = modelMatrix * vec4(position, 1.0);",
+        "  vWorldPos = wp.xyz;",
+        "  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);",
+        "}"
+      ].join("\n"),
+      fragmentShader: [
+        "uniform vec3 sunPosition;",
+        "varying vec3 vWorldPos;",
+        "void main() {",
+        "  vec3 dir = normalize(vWorldPos);",
+        "  float h = dir.y;",
+        // Sky gradient: deep blue top → warm horizon
+        "  vec3 zenith = vec3(0.08, 0.15, 0.35);",
+        "  vec3 horizon = vec3(0.45, 0.55, 0.7);",
+        "  vec3 sunHorizon = vec3(0.8, 0.5, 0.3);",
+        "  vec3 sky = mix(horizon, zenith, pow(max(h, 0.0), 0.5));",
+        // Sun glow
+        "  vec3 sunDir = normalize(sunPosition);",
+        "  float sunDot = max(dot(dir, sunDir), 0.0);",
+        "  vec3 sunGlow = sunHorizon * pow(sunDot, 8.0) * 0.8;",
+        "  vec3 sunDisc = vec3(1.0, 0.95, 0.8) * pow(sunDot, 256.0) * 2.0;",
+        // Horizon haze
+        "  float haze = 1.0 - smoothstep(0.0, 0.15, abs(h));",
+        "  sky = mix(sky, vec3(0.6, 0.55, 0.5), haze * 0.4);",
+        "  sky += sunGlow + sunDisc;",
+        // Below horizon — dark water reflection
+        "  if (h < 0.0) sky = mix(vec3(0.05, 0.1, 0.2), sky, smoothstep(-0.1, 0.0, h));",
+        "  gl_FragColor = vec4(sky, 1.0);",
+        "}"
+      ].join("\n")
     });
     scene.add(new THREE.Mesh(skyGeo, skyMat));
 
-    var camera = new THREE.PerspectiveCamera(45, w / h, .5, 800);
+    var camera = new THREE.PerspectiveCamera(50, w / h, 0.5, 800);
 
-    // Lighting — hemisphere + directional with shadows + fill
-    var hemiLight = new THREE.HemisphereLight(0x87ceeb, 0x3a6b8a, 0.6);
+    // ═══ CINEMATIC LIGHTING ═══
+    // Hemisphere: sky blue above, dark ocean below
+    var hemiLight = new THREE.HemisphereLight(0x6090c0, 0x0a2040, 0.5);
     scene.add(hemiLight);
-    var sunLight = new THREE.DirectionalLight(0xfff4e0, 1.8);
-    sunLight.position.set(60, 80, 40);
-    sunLight.castShadow = true;
-    sunLight.shadow.mapSize.width = 1024;
-    sunLight.shadow.mapSize.height = 1024;
-    sunLight.shadow.camera.near = 1;
-    sunLight.shadow.camera.far = 250;
-    sunLight.shadow.camera.left = -100;
-    sunLight.shadow.camera.right = 100;
-    sunLight.shadow.camera.top = 100;
-    sunLight.shadow.camera.bottom = -100;
-    scene.add(sunLight);
-    var fillLight = new THREE.DirectionalLight(0x8ab4d0, 0.4);
-    fillLight.position.set(-30, 20, -40);
-    scene.add(fillLight);
 
-    // Ocean — larger, deeper color, more detail for waves
-    var ocean = new THREE.Mesh(
-      new THREE.PlaneGeometry(500, 500, 128, 128),
-      new THREE.MeshStandardMaterial({
-        color: 0x1a6090,
-        roughness: 0.3,
-        metalness: 0.6,
-        transparent: true,
-        opacity: 0.92,
-        envMapIntensity: 0.8
-      })
-    );
+    // Main sun — warm golden, low angle for long shadows
+    var sunLight = new THREE.DirectionalLight(0xffeedd, 2.2);
+    sunLight.position.set(50, 35, -60);
+    sunLight.castShadow = true;
+    sunLight.shadow.mapSize.width = 2048;
+    sunLight.shadow.mapSize.height = 2048;
+    sunLight.shadow.camera.near = 1;
+    sunLight.shadow.camera.far = 300;
+    sunLight.shadow.camera.left = -120;
+    sunLight.shadow.camera.right = 120;
+    sunLight.shadow.camera.top = 120;
+    sunLight.shadow.camera.bottom = -120;
+    sunLight.shadow.bias = -0.001;
+    scene.add(sunLight);
+
+    // Rim light — cool blue backlight for depth
+    var rimLight = new THREE.DirectionalLight(0x4080c0, 0.8);
+    rimLight.position.set(-40, 15, 50);
+    scene.add(rimLight);
+
+    // Ambient fill — very subtle warm
+    var ambientLight = new THREE.AmbientLight(0x1a2030, 0.3);
+    scene.add(ambientLight);
+
+    // ═══ SHADER OCEAN ═══
+    var oceanGeo = new THREE.PlaneGeometry(600, 600, 200, 200);
+    var oceanMat = new THREE.ShaderMaterial({
+      uniforms: {
+        uTime: { value: 0 },
+        uSunDir: { value: new THREE.Vector3(0.4, 0.3, -0.6).normalize() },
+        uCameraPos: { value: new THREE.Vector3() },
+        uDeepColor: { value: new THREE.Color(0x041830) },
+        uShallowColor: { value: new THREE.Color(0x0a5070) },
+        uFoamColor: { value: new THREE.Color(0x8ab8d0) },
+      },
+      vertexShader: [
+        "uniform float uTime;",
+        "varying vec3 vWorldPos;",
+        "varying vec3 vNormal;",
+        "varying float vWaveHeight;",
+        "void main() {",
+        "  vec3 pos = position;",
+        "  float wave1 = sin(pos.x * 0.06 + uTime * 0.5) * 0.5;",
+        "  float wave2 = cos(pos.y * 0.04 + uTime * 0.3) * 0.4;",
+        "  float wave3 = sin((pos.x + pos.y) * 0.1 + uTime * 0.7) * 0.2;",
+        "  float wave4 = cos(pos.x * 0.13 - uTime * 0.25) * 0.15;",
+        "  float wave5 = sin(pos.y * 0.08 + uTime * 0.6) * 0.3;",
+        "  pos.z = wave1 + wave2 + wave3 + wave4 + wave5;",
+        "  vWaveHeight = pos.z;",
+        // Compute normal from wave derivatives
+        "  float dx = cos(pos.x * 0.06 + uTime * 0.5) * 0.06 * 0.5 + cos((pos.x + pos.y) * 0.1 + uTime * 0.7) * 0.1 * 0.2;",
+        "  float dy = -sin(pos.y * 0.04 + uTime * 0.3) * 0.04 * 0.4 + cos((pos.x + pos.y) * 0.1 + uTime * 0.7) * 0.1 * 0.2;",
+        "  vNormal = normalize(vec3(-dx, 1.0, -dy));",
+        "  vec4 worldPos = modelMatrix * vec4(pos, 1.0);",
+        "  vWorldPos = worldPos.xyz;",
+        "  gl_Position = projectionMatrix * viewMatrix * worldPos;",
+        "}"
+      ].join("\n"),
+      fragmentShader: [
+        "uniform vec3 uSunDir;",
+        "uniform vec3 uCameraPos;",
+        "uniform vec3 uDeepColor;",
+        "uniform vec3 uShallowColor;",
+        "uniform vec3 uFoamColor;",
+        "varying vec3 vWorldPos;",
+        "varying vec3 vNormal;",
+        "varying float vWaveHeight;",
+        "void main() {",
+        "  vec3 N = normalize(vNormal);",
+        "  vec3 V = normalize(uCameraPos - vWorldPos);",
+        "  vec3 L = normalize(uSunDir);",
+        // Fresnel — more reflection at grazing angles
+        "  float fresnel = pow(1.0 - max(dot(N, V), 0.0), 3.0);",
+        // Water color — deep vs shallow blend
+        "  vec3 waterColor = mix(uDeepColor, uShallowColor, smoothstep(-0.3, 0.5, vWaveHeight));",
+        // Specular sun reflection
+        "  vec3 H = normalize(L + V);",
+        "  float spec = pow(max(dot(N, H), 0.0), 256.0);",
+        "  vec3 sunSpec = vec3(1.0, 0.95, 0.8) * spec * 1.5;",
+        // Broader sun shimmer
+        "  float shimmer = pow(max(dot(N, H), 0.0), 32.0);",
+        "  vec3 sunShimmer = vec3(0.8, 0.6, 0.3) * shimmer * 0.3;",
+        // Foam on wave crests
+        "  float foam = smoothstep(0.5, 0.8, vWaveHeight) * 0.3;",
+        // Combine
+        "  vec3 color = waterColor;",
+        "  color = mix(color, vec3(0.4, 0.55, 0.7), fresnel * 0.5);", // sky reflection
+        "  color += sunSpec + sunShimmer;",
+        "  color = mix(color, uFoamColor, foam);",
+        // Distance fog
+        "  float dist = length(vWorldPos - uCameraPos);",
+        "  float fog = 1.0 - exp(-dist * 0.003);",
+        "  color = mix(color, vec3(0.1, 0.2, 0.35), fog);",
+        "  gl_FragColor = vec4(color, 0.95);",
+        "}"
+      ].join("\n"),
+      transparent: true,
+      side: THREE.DoubleSide,
+    });
+    var ocean = new THREE.Mesh(oceanGeo, oceanMat);
     ocean.rotation.x = -Math.PI / 2;
     ocean.receiveShadow = true;
     scene.add(ocean);
 
-    // Second ocean layer for depth effect
+    // Deep ocean floor
     var oceanDeep = new THREE.Mesh(
-      new THREE.PlaneGeometry(500, 500),
-      new THREE.MeshStandardMaterial({ color: 0x0a3050, roughness: 1, metalness: 0 })
+      new THREE.PlaneGeometry(600, 600),
+      new THREE.MeshBasicMaterial({ color: 0x020810 })
     );
     oceanDeep.rotation.x = -Math.PI / 2;
-    oceanDeep.position.y = -1.5;
+    oceanDeep.position.y = -3;
     scene.add(oceanDeep);
 
     // Subtle grid on the water surface
-    var grid = new THREE.GridHelper(200, 40, 0x3a8ab0, 0x3a8ab0);
-    grid.position.y = .06; grid.material.opacity = .06; grid.material.transparent = true;
-    scene.add(grid);
+    // Grid removed — shader ocean provides visual reference
 
     // Wake/foam particle system
     var wakeCount = 200;
@@ -1315,18 +1415,9 @@ export default function App() {
       var stopped = false; // never stops in v6 real-time mode
       var time = Date.now() * .001;
 
-      // Realistic ocean waves — multiple overlapping sine waves
-      var wPos = ocean.geometry.attributes.position;
-      for (var i = 0; i < wPos.count; i++) {
-        var wx = wPos.getX(i), wy = wPos.getY(i);
-        var wave1 = Math.sin(wx * 0.08 + time * 0.6) * 0.35;
-        var wave2 = Math.cos(wy * 0.06 + time * 0.4) * 0.25;
-        var wave3 = Math.sin((wx + wy) * 0.12 + time * 0.9) * 0.15;
-        var wave4 = Math.cos(wx * 0.15 - time * 0.3) * 0.1;
-        wPos.setZ(i, wave1 + wave2 + wave3 + wave4);
-      }
-      wPos.needsUpdate = true;
-      ocean.geometry.computeVertexNormals();
+      // Update ocean shader uniforms (waves computed on GPU)
+      oceanMat.uniforms.uTime.value = time;
+      oceanMat.uniforms.uCameraPos.value.copy(camera.position);
 
       // Boats bob and roll with the waves
       var bob = function(o) { return Math.sin(time * 1.8 + o) * .18 + Math.cos(time * 1.2 + o * 2) * .08 + .5; };
@@ -1680,7 +1771,7 @@ export default function App() {
           el._fpvBigRenderer = new THREE.WebGLRenderer({ canvas: fpvBigRef.current, antialias: true });
           el._fpvBigRenderer.setSize(el._fpvBigW, el._fpvBigH);
           el._fpvBigRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-          el._fpvBigRenderer.setClearColor(0x87ceeb);
+          el._fpvBigRenderer.setClearColor(0x0a1520);
           el._fpvBigCam = new THREE.PerspectiveCamera(55, el._fpvBigW / el._fpvBigH, 0.5, 300);
         }
         var bigR = el._fpvBigRenderer, bigC = el._fpvBigCam;
@@ -1713,12 +1804,12 @@ export default function App() {
       fpvRendererA = new THREE.WebGLRenderer({ canvas: fpvARef.current, antialias: false });
       fpvRendererA.setSize(fpvW, fpvHt);
       fpvRendererA.setPixelRatio(1);
-      fpvRendererA.setClearColor(0x87ceeb);
+      fpvRendererA.setClearColor(0x0a1520);
 
       fpvRendererB = new THREE.WebGLRenderer({ canvas: fpvBRef.current, antialias: false });
       fpvRendererB.setSize(fpvW, fpvHt);
       fpvRendererB.setPixelRatio(1);
-      fpvRendererB.setClearColor(0x87ceeb);
+      fpvRendererB.setClearColor(0x0a1520);
 
       fpvCamA = new THREE.PerspectiveCamera(60, fpvW / fpvHt, 0.5, 200);
       fpvCamB = new THREE.PerspectiveCamera(60, fpvW / fpvHt, 0.5, 200);

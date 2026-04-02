@@ -743,6 +743,8 @@ export default function App() {
   var [tick, setTick] = useState(0);
   var [playing, setPlaying] = useState(false);
   var [speed, setSpeed] = useState(1);
+  var [destroyPhase, setDestroyPhase] = useState("none"); // none, awaiting, striking, destroyed
+  var [strikeStart, setStrikeStart] = useState(0);
   var [mapWidth, setMapWidth] = useState(35); // percentage of viewport
   var draggingDivider = useRef(false);
   var containerRef = useRef(null);
@@ -1511,6 +1513,28 @@ export default function App() {
   var ts = tick >= sc.PE[sc.triangPhaseIdx];
   var st = sc.posAt(tick);
 
+  // When track completes → await destroy confirmation
+  if (tick >= TOTAL - 1 && destroyPhase === "none" && playing) {
+    setDestroyPhase("awaiting");
+    setPlaying(false);
+  }
+
+  // During strike — override drone positions to fly toward target
+  if (destroyPhase === "striking") {
+    var strikeT = (Date.now() - strikeStart) / 1000;
+    var strikeSpeed = 5;
+    if (strikeT < 2) {
+      var slerp = Math.min(strikeT / 1.5, 1);
+      st = Object.assign({}, st, {
+        aP: { x: lr(st.aP.x, st.tg.x, slerp), z: lr(st.aP.z, st.tg.z, slerp) },
+        bP: { x: lr(st.bP.x, st.tg.x, slerp), z: lr(st.bP.z, st.tg.z, slerp) }
+      });
+    }
+    if (strikeT > 1.5 && destroyPhase !== "destroyed") setDestroyPhase("destroyed");
+  }
+
+  // lr already defined globally
+
   // Derived IMU data
   var prevSt = tick > 0 ? sc.posAt(tick - 1) : st;
   var aSpeed = d3(st.aP, prevSt.aP) / TICK_DT;
@@ -1529,8 +1553,8 @@ export default function App() {
   var btn = { border: "none", cursor: "pointer", fontFamily: "monospace", fontWeight: 600, fontSize: 11, borderRadius: 6, padding: "7px 18px" };
 
   return (
-    <div style={{ fontFamily: "'JetBrains Mono', monospace", color: "#c0d0e0", background: "#080c12", overflow: "hidden", width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
-      <div style={{ padding: "4px 12px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#0c1018", borderBottom: "1px solid #141e2a", height: 32 }}>
+    <div style={{ fontFamily: "monospace", color: "#2a3a4a", background: "#f0f4f8", overflow: "hidden", width: "100%", height: "100%", display: "flex", flexDirection: "column" }}>
+      <div style={{ padding: "6px 14px", display: "flex", justifyContent: "space-between", alignItems: "center", background: "#fff", borderBottom: "1px solid #e0e8f0" }}>
         <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
           <div style={{ width: 7, height: 7, borderRadius: "50%", background: playing ? "#0a8a5a" : "#c0ccd4" }} />
           <span style={{ fontSize: 14, fontWeight: 800, color: "#0a8a5a", letterSpacing: 1.5 }}>SEADRONE</span>
@@ -1543,13 +1567,16 @@ export default function App() {
           <select value={commProto} onChange={function(e) { setCommProto(e.target.value); }} style={{ fontFamily: "monospace", fontSize: 10, fontWeight: 600, padding: "4px 8px", borderRadius: 5, border: "1px solid " + PROTOCOLS[commProto].color + "60", background: PROTOCOLS[commProto].color + "15", color: PROTOCOLS[commProto].color, cursor: "pointer" }}>
             {Object.values(PROTOCOLS).map(function(p) { return <option key={p.id} value={p.id}>{p.name}</option>; })}
           </select>
-          {(function() { var info = sc.statusText(st, phase, ts); return info ? <span style={{ color: info.color, fontWeight: 700 }}>{info.icon} {info.text}</span> : null; })()}
+          {destroyPhase === "destroyed" ? <span style={{ color: "#c03030", fontWeight: 700 }}>TARGET DESTROYED</span>
+            : destroyPhase === "striking" ? <span style={{ color: "#c03030", fontWeight: 700 }}>STRIKE INBOUND</span>
+            : destroyPhase === "awaiting" ? <span style={{ color: "#c06020", fontWeight: 700 }}>AWAITING GS CONFIRMATION</span>
+            : (function() { var info = sc.statusText(st, phase, ts); return info ? <span style={{ color: info.color, fontWeight: 700 }}>{info.icon} {info.text}</span> : null; })()}
           <span style={{ color: "#b0bcc8", fontSize: 10 }}>T+{(tick / TOTAL * 65).toFixed(1)}s</span>
         </div>
       </div>
 
       <div ref={containerRef} style={{ display: "flex", flex: 1, minHeight: 0 }}>
-        <div ref={mountRef} style={{ flex: 1, cursor: "grab", position: "relative", background: "#0a1018", minWidth: 0 }}>
+        <div ref={mountRef} style={{ flex: 1, cursor: "grab", position: "relative", background: "#eef3f8", minWidth: 0 }}>
           <div style={{ position: "absolute", top: 8, left: 10, fontSize: 9, fontWeight: 700, color: "#0a8a5a", background: "#f8fafbdd", padding: "2px 8px", borderRadius: 4, border: "1px solid #e0e8f0", zIndex: 1 }}>3D VIEW</div>
           <div style={{ position: "absolute", bottom: 8, left: 10, fontSize: 8, color: "#a0b0c0", zIndex: 1 }}>Drag · Scroll</div>
 
@@ -1609,7 +1636,7 @@ export default function App() {
           onMouseDown={onDividerDown}
           onTouchStart={onDividerDown}
           style={{
-            width: 4, cursor: "col-resize", background: "#141e2a", flexShrink: 0,
+            width: 5, cursor: "col-resize", background: "#e0e8f0", flexShrink: 0,
             display: "flex", alignItems: "center", justifyContent: "center",
             transition: "background 0.15s"
           }}
@@ -1622,7 +1649,7 @@ export default function App() {
           width: mapWidth + "%",
           flexShrink: 0,
           padding: 10,
-          background: "#0c1018",
+          background: "#fafcfe",
           display: "flex", flexDirection: "column", gap: 6
         }}>
           <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
@@ -1634,7 +1661,15 @@ export default function App() {
               </button>
             </div>
           </div>
-          <Map2D tick={tick} scenario={sc} proto={commProto} />
+          <div style={{ position: "relative" }}>
+            <Map2D tick={tick} scenario={sc} proto={commProto} />
+            {destroyPhase === "destroyed" && <div style={{ position: "absolute", top: "50%", left: "50%", transform: "translate(-50%, -50%)", textAlign: "center", pointerEvents: "none" }}>
+              <div style={{ fontSize: 28, fontWeight: 900, color: "#c03030", textShadow: "0 0 20px #c0303080", letterSpacing: 3 }}>DESTROYED</div>
+              <div style={{ width: 60, height: 60, borderRadius: "50%", background: "#ff440060", margin: "8px auto", border: "3px solid #ff4400" }}>
+                <div style={{ width: "100%", height: "100%", borderRadius: "50%", background: "radial-gradient(circle, #ffaa00 0%, #ff4400 40%, transparent 70%)" }} />
+              </div>
+            </div>}
+          </div>
           {!mapFull && <div style={{ display: "flex", gap: 6 }}>
             <div style={{ flex: 1 }}><CommDashboard comm={comm} proto={commProto} /></div>
             <div style={{ flex: 1 }}><PathOptPanel st={st} triangPhaseIdx={sc.triangPhaseIdx} /></div>
@@ -1652,7 +1687,7 @@ export default function App() {
         </div>
       </div>
 
-      <div style={{ padding: "4px 12px 6px", background: "#0c1018", borderTop: "1px solid #141e2a" }}>
+      <div style={{ padding: "6px 14px 8px", background: "#fff", borderTop: "1px solid #e0e8f0" }}>
         <div style={{ display: "flex", gap: 2, marginBottom: 6 }}>
           {sc.PHASES.map(function(p, idx) {
             var start = idx === 0 ? 0 : sc.PE[idx - 1];
@@ -1670,7 +1705,9 @@ export default function App() {
             onClick={function() { if (tick >= TOTAL - 1) setTick(0); setPlaying(!playing); }}>
             {playing ? "Pause" : tick >= TOTAL - 1 ? "Replay" : "▶ Play"}
           </button>
-          <button style={{ ...btn, background: "#f2f6f9", color: "#8a9aaa", border: "1px solid #dce6ef" }} onClick={function() { setPlaying(false); setTick(0); }}>Reset</button>
+          <button style={{ ...btn, background: "#f2f6f9", color: "#8a9aaa", border: "1px solid #dce6ef" }} onClick={function() { setPlaying(false); setTick(0); setDestroyPhase("none"); }}>Reset</button>
+          {destroyPhase === "awaiting" && <button style={{ ...btn, background: "#c03030", color: "#fff", border: "2px solid #c03030", animation: "pulse 1s infinite", fontWeight: 800, fontSize: 12, padding: "7px 24px" }} onClick={function() { setDestroyPhase("striking"); setStrikeStart(Date.now()); }}>CONFIRM DESTROY</button>}
+          {destroyPhase === "destroyed" && <span style={{ fontWeight: 800, color: "#c03030", fontSize: 13 }}>TARGET DESTROYED</span>}
           <div style={{ display: "flex", gap: 2, background: "#f2f6f9", borderRadius: 6, padding: 2, border: "1px solid #e4ecf2" }}>
             {[.5, 1, 2, 3].map(function(s) {
               return <button key={s} onClick={function() { setSpeed(s); }} style={{ border: "none", cursor: "pointer", fontFamily: "monospace", fontSize: 10, fontWeight: speed === s ? 700 : 400, padding: "4px 10px", borderRadius: 4, background: speed === s ? "#fff" : "transparent", color: speed === s ? "#0a8a5a" : "#a0b0c0", boxShadow: speed === s ? "0 1px 3px #0001" : "none" }}>{s}x</button>;
